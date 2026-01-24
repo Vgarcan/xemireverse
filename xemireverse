@@ -1,0 +1,829 @@
+#!/usr/bin/env bash
+
+###############################################################################
+# Reverse Manager 3.3
+#
+# Nginx reverse proxy manager for multiple backends (static, WordPress,
+# Django, etc.), with Cloudflare in front and optional SSL termination.
+#
+# DB line format:
+#   domain;backend_url;wildcard=yes|no;ssl=yes|no
+###############################################################################
+
+set -o pipefail
+
+# ---------- Colors ----------
+
+RED="\e[31m"
+GREEN="\e[32m"
+YELLOW="\e[33m"
+BLUE="\e[34m"
+CYAN="\e[36m"
+BOLD="\e[1m"
+RESET="\e[0m"
+
+# ---------- Global paths ----------
+
+NGINX_CONF_DIR="/etc/nginx/conf.d"
+DB_FILE="/etc/nginx/reverse-manager.db"
+CERT_DIR="/etc/ssl/cloudflare"
+
+MIN_DELAY=0.5
+SELECTED_DOMAIN=""
+
+# ---------- Basic helpers ----------
+
+require_root() {
+    if [[ "$EUID" -ne 0 ]]; then
+        echo -e "${RED}This script must be run as root.${RESET}"
+        exit 1
+    fi
+}
+
+ensure_paths() {
+    mkdir -p "$NGINX_CONF_DIR"
+    mkdir -p "$CERT_DIR"
+    [[ -f "$DB_FILE" ]] || touch "$DB_FILE"
+}
+
+smooth() { sleep "$MIN_DELAY"; }
+
+pause() {
+    echo
+    read -rp "Press Enter to continue..." _
+}
+
+header() {
+    clear
+    echo -e "${BOLD}${CYAN}Reverse Manager 3.3 - Nginx Reverse Proxy Control${RESET}"
+    echo -e "${CYAN}Manage domains, backends (HTTP/HTTPS), wildcard and SSL (Cloudflare-friendly).${RESET}"
+    echo
+}
+
+# ---------- Package manager detection ----------
+
+detect_pkg_manager() {
+    if command -v dnf >/dev/null 2>&1; then
+        echo "dnf"
+    elif command -v yum >/dev/null 2>&1; then
+        echo "yum"
+    elif command -v apt-get >/dev/null 2>&1; then
+        echo "apt"
+    else
+        echo ""
+    fi
+}
+
+install_package() {
+    local pkg="$1"
+    local pm
+    pm="$(detect_pkg_manager)"
+
+    if [[ -z "$pm" ]]; then
+        echo -e "${YELLOW}No known package manager found. Please install ${pkg} manually.${RESET}"
+        return 1
+    fi
+
+    echo -e "${CYAN}Attempting to install package: ${pkg} (${pm})${RESET}"
+
+    case "$pm" in
+        dnf)  dnf install -y "$pkg" ;;
+        yum)  yum install -y "$pkg" ;;
+        apt)  apt-get update && apt-get install -y "$pkg" ;;
+    esac
+
+    if [[ $? -eq 0 ]]; then
+        echo -e "${GREEN}Package ${pkg} installed successfully.${RESET}"
+        return 0
+    else
+        echo -e "${RED}Package installation failed for ${pkg}.${RESET}"
+        return 1
+    fi
+}
+
+# ---------- DB helpers ----------
+
+get_domain_entry() {
+    local domain="$1"
+    grep -E "^${domain};" "$DB_FILE"
+}
+
+save_domain_entry() {
+    local domain="$1"
+    local backend_url="$2"
+    local wildcard="$3"
+    local ssl="$4"
+
+    if grep -qE "^${domain};" "$DB_FILE"; then
+        sed -i "s|^${domain};.*|${domain};${backend_url};wildcard=${wildcard};ssl=${ssl}|" "$DB_FILE"
+    else
+        echo "${domain};${backend_url};wildcard=${wildcard};ssl=${ssl}" >> "$DB_FILE"
+    fi
+}
+
+delete_domain_entry() {
+    local domain="$1"
+    sed -i "/^${domain};/d" "$DB_FILE"
+}
+
+parse_entry() {
+    local entry="$1"
+    ENTRY_DOMAIN="$(echo "$entry"      | cut -d';' -f1)"
+    ENTRY_BACKEND_URL="$(echo "$entry" | cut -d';' -f2)"
+    ENTRY_WILDCARD="$(echo "$entry"    | cut -d';' -f3 | cut -d'=' -f2)"
+    ENTRY_SSL="$(echo "$entry"         | cut -d';' -f4 | cut -d'=' -f2)"
+}
+
+# ---------- Backend URL helpers ----------
+
+parse_backend_url() {
+    local url="$1"
+
+    BACKEND_SCHEME=""
+    BACKEND_HOST=""
+    BACKEND_PORT=""
+
+    local rest
+    if [[ "$url" == *"://"* ]]; then
+        BACKEND_SCHEME="${url%%://*}"
+        rest="${url#*://}"
+    else
+        BACKEND_SCHEME="http"
+        rest="$url"
+    fi
+
+    if [[ "$rest" == *":"* ]]; then
+        BACKEND_HOST="${rest%%:*}"
+        BACKEND_PORT="${rest##*:}"
+        [[ "$BACKEND_HOST" == "$BACKEND_PORT" ]] && BACKEND_PORT=""
+    else
+        BACKEND_HOST="$rest"
+        BACKEND_PORT=""
+    fi
+
+    [[ -z "$BACKEND_SCHEME" ]] && BACKEND_SCHEME="http"
+}
+
+rebuild_backend_url() {
+    local scheme="$1"
+    local host="$2"
+    local port="$3"
+
+    [[ -z "$scheme" ]] && scheme="http"
+    [[ -z "$host" ]] && { echo ""; return 1; }
+
+    host="${host%/}"
+
+    if [[ -n "$port" ]]; then
+        echo "${scheme}://${host}:${port}"
+    else
+        echo "${scheme}://${host}"
+    fi
+}
+
+normalize_backend_url() {
+    local input="$1"
+
+    input="$(echo "$input" | xargs)"
+    [[ -z "$input" ]] && { echo ""; return 1; }
+
+    if [[ "$input" != http://* && "$input" != https://* ]]; then
+        input="http://$input"
+    fi
+
+    input="${input%/}"
+    parse_backend_url "$input"
+    [[ -z "$BACKEND_HOST" ]] && { echo ""; return 1; }
+
+    echo "$input"
+    return 0
+}
+
+# ---------- Domain selection ----------
+
+select_domain_from_db() {
+    if [[ ! -s "$DB_FILE" ]]; then
+        echo -e "${RED}No domains registered yet.${RESET}"
+        smooth
+        return 1
+    fi
+
+    local lines=()
+    local line
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        lines+=("$line")
+    done < "$DB_FILE"
+
+    local count="${#lines[@]}"
+    (( count == 0 )) && { echo -e "${RED}No domains registered yet.${RESET}"; smooth; return 1; }
+
+    echo -e "${BOLD}Select a domain:${RESET}"
+    echo
+
+    local idx=0
+    for line in "${lines[@]}"; do
+        parse_entry "$line"
+        printf "  %2d) %-30s -> %s\n" "$((idx + 1))" "$ENTRY_DOMAIN" "$ENTRY_BACKEND_URL"
+        idx=$((idx + 1))
+    done
+
+    echo
+    read -rp "Enter number: " choice
+    [[ ! "$choice" =~ ^[0-9]+$ ]] && { echo -e "${RED}Invalid selection.${RESET}"; smooth; return 1; }
+
+    local index=$((choice - 1))
+    (( index < 0 || index >= count )) && { echo -e "${RED}Selection out of range.${RESET}"; smooth; return 1; }
+
+    parse_entry "${lines[$index]}"
+    SELECTED_DOMAIN="$ENTRY_DOMAIN"
+    return 0
+}
+
+# ---------- SSL helpers (with existence check) ----------
+
+check_cert_files() {
+    local domain="$1"
+    local cert_file="${CERT_DIR}/${domain}.pem"
+    local key_file="${CERT_DIR}/${domain}.key"
+
+    [[ -f "$cert_file" && -f "$key_file" ]]
+}
+
+generate_self_signed_cert() {
+    local domain="$1"
+    local cert_file="${CERT_DIR}/${domain}.pem"
+    local key_file="${CERT_DIR}/${domain}.key"
+
+    echo -e "${CYAN}Generating self-signed certificate for ${domain}...${RESET}"
+    mkdir -p "$CERT_DIR"
+
+    openssl req -x509 -nodes -newkey rsa:2048 \
+        -keyout "$key_file" \
+        -out "$cert_file" \
+        -days 365 \
+        -subj "/CN=${domain}"
+
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}OpenSSL failed while creating certificate for ${domain}.${RESET}"
+        return 1
+    fi
+
+    chmod 600 "$cert_file" "$key_file"
+
+    echo -e "${GREEN}Self-signed certificate created:${RESET}"
+    echo -e "  ${cert_file}"
+    echo -e "  ${key_file}"
+    return 0
+}
+
+setup_ssl_for_domain() {
+    local domain="$1"
+    local cert_file="${CERT_DIR}/${domain}.pem"
+    local key_file="${CERT_DIR}/${domain}.key"
+
+    if check_cert_files "$domain"; then
+        echo
+        echo -e "${CYAN}Existing certificate and key found for ${domain}.${RESET}"
+        echo -e "  Certificate: ${cert_file}"
+        echo -e "  Key        : ${key_file}"
+        echo
+        echo -e "${CYAN}Choose how to proceed:${RESET}"
+        echo -e "  ${GREEN}1${RESET}) Use existing files"
+        echo -e "  ${GREEN}2${RESET}) Generate new self-signed and overwrite"
+        echo
+        read -rp "Option (1/2): " opt
+
+        case "$opt" in
+            1)
+                echo -e "${GREEN}Using existing certificate and key for ${domain}.${RESET}"
+                return 0
+                ;;
+            2)
+                generate_self_signed_cert "$domain" || {
+                    echo -e "${RED}Failed to generate new certificate. Existing files are still there.${RESET}"
+                    return 1
+                }
+                return 0
+                ;;
+            *)
+                echo -e "${YELLOW}Invalid choice. Keeping existing certificate and key.${RESET}"
+                return 0
+                ;;
+        esac
+    else
+        echo
+        echo -e "${YELLOW}No certificate/key found for ${domain}.${RESET}"
+        echo -e "${CYAN}Generating a new self-signed certificate automatically...${RESET}"
+        generate_self_signed_cert "$domain" || {
+            echo -e "${RED}Automatic certificate generation failed. Nginx may fail to reload if certs are missing.${RESET}"
+            return 1
+        }
+        return 0
+    fi
+}
+
+# ---------- Nginx config generation ----------
+
+generate_nginx_conf() {
+    local domain="$1"
+    local backend_url="$2"
+    local wildcard="$3"
+    local ssl="$4"
+
+    local conf_file="${NGINX_CONF_DIR}/${domain}.conf"
+    local server_name_line
+
+    if [[ "$wildcard" == "yes" ]]; then
+        server_name_line="server_name ${domain} *.${domain};"
+    else
+        server_name_line="server_name ${domain} www.${domain};"
+    fi
+
+    local cert_file="${CERT_DIR}/${domain}.pem"
+    local key_file="${CERT_DIR}/${domain}.key"
+
+    local proxy_ssl_block=""
+    if [[ "$backend_url" == https://* ]]; then
+        proxy_ssl_block=$'        proxy_ssl_server_name on;\n        proxy_ssl_verify off;\n'
+    fi
+
+    cat > "$conf_file" <<EOF
+##
+## Auto generated by Reverse Manager 3.3
+## Domain       : ${domain}
+## Backend URL  : ${backend_url}
+## Wildcard     : ${wildcard}
+## SSL (reverse): ${ssl}
+##
+EOF
+
+    if [[ "$ssl" == "yes" ]]; then
+        cat >> "$conf_file" <<EOF
+# HTTP: redirect everything to HTTPS
+server {
+    listen 80;
+    ${server_name_line}
+
+    return 301 https://\$host\$request_uri;
+}
+
+EOF
+    else
+        cat >> "$conf_file" <<EOF
+# HTTP only (no SSL in reverse)
+server {
+    listen 80;
+    ${server_name_line}
+
+    location / {
+        proxy_pass ${backend_url};
+${proxy_ssl_block}        proxy_set_header Host              \$host;
+        proxy_set_header X-Real-IP         \$remote_addr;
+        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Host  \$host;
+
+        proxy_connect_timeout 60s;
+        proxy_send_timeout    60s;
+        proxy_read_timeout    60s;
+        proxy_http_version    1.1;
+        proxy_set_header Connection "";
+    }
+}
+
+EOF
+    fi
+
+    if [[ "$ssl" == "yes" ]]; then
+        cat >> "$conf_file" <<EOF
+# HTTPS: Cloudflare → Reverse (TLS terminated here)
+server {
+    listen 443 ssl http2;
+    ${server_name_line}
+
+    ssl_certificate     ${cert_file};
+    ssl_certificate_key ${key_file};
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+
+    location / {
+        proxy_pass ${backend_url};
+${proxy_ssl_block}        proxy_set_header Host              \$host;
+        proxy_set_header X-Real-IP         \$remote_addr;
+        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Host  \$host;
+
+        proxy_connect_timeout 60s;
+        proxy_send_timeout    60s;
+        proxy_read_timeout    60s;
+        proxy_http_version    1.1;
+        proxy_set_header Connection "";
+    }
+}
+
+EOF
+    fi
+}
+
+# ---------- Main actions ----------
+
+create_domain() {
+    header
+    echo -e "${BOLD}Create a new domain configuration${RESET}"
+    echo
+    read -rp "Domain (example.com, no http/https): " domain
+    [[ -z "$domain" ]] && { echo -e "${RED}Domain cannot be empty.${RESET}"; smooth; return; }
+
+    if get_domain_entry "$domain" >/dev/null; then
+        echo -e "${RED}Domain already exists in registry.${RESET}"
+        smooth
+        return
+    fi
+
+    echo
+    echo -e "${CYAN}Backend URL examples:${RESET}"
+    echo -e "  192.168.2.116:80        → http://192.168.2.116:80"
+    echo -e "  http://192.168.2.116:9001"
+    echo -e "  https://192.168.2.120:8443"
+    echo
+    read -rp "Backend URL: " raw_backend
+    local backend_url
+    backend_url="$(normalize_backend_url "$raw_backend")" || {
+        echo -e "${RED}Invalid backend URL. Please try again.${RESET}"
+        smooth
+        return
+    }
+
+    local wildcard="no"
+    local ssl="no"
+    local ans
+
+    echo
+    echo -e "${CYAN}Wildcard 'yes' means *.${domain} will also use this backend (unless another specific domain is defined).${RESET}"
+    read -rp "Enable wildcard for this domain? (y/n): " ans
+    ans="${ans,,}"
+    [[ "$ans" == "y" || "$ans" == "yes" ]] && wildcard="yes"
+
+    echo
+    echo -e "${CYAN}Enable SSL (HTTPS) on the reverse for this domain?${RESET}"
+    read -rp "(y/n): " ans
+    ans="${ans,,}"
+
+    if [[ "$ans" == "y" || "$ans" == "yes" ]]; then
+        ssl="yes"
+        setup_ssl_for_domain "$domain"
+    fi
+
+    save_domain_entry "$domain" "$backend_url" "$wildcard" "$ssl"
+    generate_nginx_conf "$domain" "$backend_url" "$wildcard" "$ssl"
+
+    echo
+    echo -e "${GREEN}Domain ${domain} created.${RESET}"
+    echo -e "  Backend URL: ${backend_url}"
+    echo -e "  Wildcard   : ${wildcard}"
+    echo -e "  SSL (rev.) : ${ssl}"
+    echo
+    echo -e "${CYAN}Next steps:${RESET}"
+    echo -e "  1) Option 6: Test Nginx configuration (nginx -t)"
+    echo -e "  2) Option 7: Reload Nginx"
+    pause
+}
+
+list_domains() {
+    header
+    echo -e "${BOLD}Registered domains${RESET}"
+    echo
+
+    if [[ ! -s "$DB_FILE" ]]; then
+        echo -e "${RED}No domains registered yet.${RESET}"
+        pause
+        return
+    fi
+
+    printf "%-30s %-35s %-10s %-6s\n" "Domain" "Backend URL" "Wildcard" "SSL"
+    printf "%-30s %-35s %-10s %-6s\n" "------" "-----------" "--------" "----"
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        parse_entry "$line"
+        printf "%-30s %-35s %-10s %-6s\n" \
+            "$ENTRY_DOMAIN" \
+            "$ENTRY_BACKEND_URL" \
+            "$ENTRY_WILDCARD" \
+            "$ENTRY_SSL"
+    done < "$DB_FILE"
+
+    pause
+}
+
+view_domain_conf() {
+    header
+    echo -e "${BOLD}View Nginx configuration for a domain${RESET}"
+    echo
+
+    if ! select_domain_from_db; then
+        return
+    fi
+
+    local conf="${NGINX_CONF_DIR}/${SELECTED_DOMAIN}.conf"
+    if [[ ! -f "$conf" ]]; then
+        echo -e "${RED}Config file not found for ${SELECTED_DOMAIN}.${RESET}"
+        pause
+        return
+    fi
+
+    echo
+    echo -e "${CYAN}Showing configuration for ${SELECTED_DOMAIN}:${RESET}"
+    echo
+    less "$conf"
+}
+
+delete_domain() {
+    header
+    echo -e "${BOLD}Delete a domain configuration${RESET}"
+    echo
+
+    if ! select_domain_from_db; then
+        return
+    fi
+
+    echo
+    read -rp "Are you sure you want to delete ${SELECTED_DOMAIN}? (y/n): " ans
+    ans="${ans,,}"
+    if [[ "$ans" != "y" && "$ans" != "yes" ]]; then
+        echo -e "${YELLOW}Deletion cancelled.${RESET}"
+        smooth
+        return
+    fi
+
+    delete_domain_entry "$SELECTED_DOMAIN"
+    local conf="${NGINX_CONF_DIR}/${SELECTED_DOMAIN}.conf"
+    [[ -f "$conf" ]] && rm -f "$conf"
+
+    echo -e "${GREEN}Domain ${SELECTED_DOMAIN} removed.${RESET}"
+    pause
+}
+
+edit_domain() {
+    header
+    echo -e "${BOLD}Edit domain settings${RESET}"
+    echo
+
+    if ! select_domain_from_db; then
+        return
+    fi
+
+    local entry
+    entry="$(get_domain_entry "$SELECTED_DOMAIN")"
+    [[ -z "$entry" ]] && { echo -e "${RED}Domain not found in registry.${RESET}"; pause; return; }
+
+    parse_entry "$entry"
+
+    while true; do
+        parse_backend_url "$ENTRY_BACKEND_URL"
+
+        header
+        echo -e "${BOLD}Editing:${RESET} ${GREEN}${ENTRY_DOMAIN}${RESET}"
+        echo
+        echo -e "  Backend URL : ${ENTRY_BACKEND_URL}"
+        echo -e "  Scheme      : ${BACKEND_SCHEME}"
+        echo -e "  Host        : ${BACKEND_HOST}"
+        echo -e "  Port        : ${BACKEND_PORT}"
+        echo
+        echo -e "  Wildcard    : ${ENTRY_WILDCARD}"
+        echo -e "  SSL (rev.)  : ${ENTRY_SSL}"
+        echo
+        echo -e "  ${GREEN}1${RESET}) Change backend URL (raw, auto-normalised)"
+        echo -e "  ${GREEN}2${RESET}) Change backend host"
+        echo -e "  ${GREEN}3${RESET}) Change backend port"
+        echo -e "  ${GREEN}4${RESET}) Toggle wildcard (yes/no)"
+        echo -e "  ${GREEN}5${RESET}) Toggle SSL (yes/no) and manage certificates"
+        echo -e "  ${GREEN}0${RESET}) Back to previous menu"
+        echo
+        read -rp "Option: " opt
+
+        case "$opt" in
+            1)
+                echo
+                echo -e "${CYAN}Examples:${RESET}"
+                echo -e "  192.168.2.116:80"
+                echo -e "  http://192.168.2.116:9001"
+                echo -e "  https://192.168.2.120:8443"
+                read -rp "New backend URL: " raw
+                local nb
+                nb="$(normalize_backend_url "$raw")" || {
+                    echo -e "${RED}Invalid backend URL. Change aborted.${RESET}"
+                    smooth
+                    continue
+                }
+                ENTRY_BACKEND_URL="$nb"
+                ;;
+            2)
+                echo
+                read -rp "New backend host (current: ${BACKEND_HOST}): " nh
+                [[ -z "$nh" ]] && { echo -e "${RED}Host cannot be empty.${RESET}"; smooth; continue; }
+                BACKEND_HOST="$nh"
+                local new_url
+                new_url="$(rebuild_backend_url "$BACKEND_SCHEME" "$BACKEND_HOST" "$BACKEND_PORT")" || {
+                    echo -e "${RED}Failed to rebuild backend URL.${RESET}"
+                    smooth
+                    continue
+                }
+                ENTRY_BACKEND_URL="$new_url"
+                ;;
+            3)
+                echo
+                read -rp "New backend port (current: ${BACKEND_PORT}, empty to clear): " np
+                BACKEND_PORT="$np"
+                local new_url2
+                new_url2="$(rebuild_backend_url "$BACKEND_SCHEME" "$BACKEND_HOST" "$BACKEND_PORT")" || {
+                    echo -e "${RED}Failed to rebuild backend URL.${RESET}"
+                    smooth
+                    continue
+                }
+                ENTRY_BACKEND_URL="$new_url2"
+                ;;
+            4)
+                [[ "$ENTRY_WILDCARD" == "yes" ]] && ENTRY_WILDCARD="no" || ENTRY_WILDCARD="yes"
+                ;;
+            5)
+                if [[ "$ENTRY_SSL" == "yes" ]]; then
+                    ENTRY_SSL="no"
+                    echo -e "${YELLOW}SSL disabled for ${ENTRY_DOMAIN}.${RESET}"
+                else
+                    ENTRY_SSL="yes"
+                    setup_ssl_for_domain "$ENTRY_DOMAIN"
+                fi
+                ;;
+            0)
+                break
+                ;;
+            *)
+                echo -e "${RED}Invalid option.${RESET}"
+                smooth
+                continue
+                ;;
+        esac
+
+        save_domain_entry "$ENTRY_DOMAIN" "$ENTRY_BACKEND_URL" "$ENTRY_WILDCARD" "$ENTRY_SSL"
+        generate_nginx_conf "$ENTRY_DOMAIN" "$ENTRY_BACKEND_URL" "$ENTRY_WILDCARD" "$ENTRY_SSL"
+        echo -e "${GREEN}Domain updated and Nginx config regenerated.${RESET}"
+        pause
+    done
+}
+
+test_nginx() {
+    header
+    echo -e "${BOLD}Testing Nginx configuration...${RESET}"
+    echo
+    nginx -t
+    pause
+}
+
+reload_nginx() {
+    header
+    echo -e "${BOLD}Reloading Nginx...${RESET}"
+    echo
+    if systemctl reload nginx; then
+        echo -e "${GREEN}Nginx reloaded successfully.${RESET}"
+    else
+        echo -e "${RED}Reload failed. Check 'nginx -t' and 'systemctl status nginx'.${RESET}"
+    fi
+    pause
+}
+
+env_check_and_setup() {
+    header
+    echo -e "${BOLD}Environment check and basic setup${RESET}"
+    echo
+
+    if [[ -f /etc/os-release ]]; then
+        echo -e "${CYAN}OS information:${RESET}"
+        . /etc/os-release
+        echo "  Name   : ${NAME}"
+        echo "  Version: ${VERSION}"
+        echo
+    fi
+
+    if command -v nginx >/dev/null 2>&1; then
+        echo -e "${GREEN}Nginx binary found: $(command -v nginx)${RESET}"
+    else
+        echo -e "${RED}Nginx binary not found.${RESET}"
+        read -rp "Install nginx now? (y/n): " ans
+        ans="${ans,,}"
+        if [[ "$ans" == "y" || "$ans" == "yes" ]]; then
+            install_package "nginx"
+        fi
+    fi
+    echo
+
+    if systemctl list-unit-files | grep -q "^nginx.service"; then
+        echo -e "${GREEN}nginx.service is present in systemd.${RESET}"
+        echo
+        systemctl status nginx --no-pager || true
+    else
+        echo -e "${YELLOW}nginx.service not found in systemd. Configure the service manually if needed.${RESET}"
+    fi
+    echo
+
+    echo -e "${CYAN}Checking directories and DB file:${RESET}"
+    echo "  NGINX_CONF_DIR: $NGINX_CONF_DIR"
+    echo "  CERT_DIR      : $CERT_DIR"
+    echo "  DB_FILE       : $DB_FILE"
+    ensure_paths
+    echo -e "${GREEN}Directories and DB file ensured.${RESET}"
+    echo
+
+    if command -v getsebool >/dev/null 2>&1; then
+        echo -e "${CYAN}SELinux httpd_can_network_connect status:${RESET}"
+        if getsebool httpd_can_network_connect 2>/dev/null; then
+            local current
+            current="$(getsebool httpd_can_network_connect | awk '{print $3}')"
+            echo "  Current value: ${current}"
+            if [[ "$current" != "on" ]]; then
+                read -rp "Enable httpd_can_network_connect permanently? (y/n): " ans
+                ans="${ans,,}"
+                if [[ "$ans" == "y" || "$ans" == "yes" ]]; then
+                    setsebool -P httpd_can_network_connect 1
+                    echo -e "${GREEN}SELinux boolean httpd_can_network_connect enabled.${RESET}"
+                fi
+            fi
+        else
+            echo -e "${YELLOW}Could not query httpd_can_network_connect. Check SELinux manually if required.${RESET}"
+        fi
+    else
+        echo -e "${YELLOW}SELinux tools (getsebool) not found. Skipping SELinux check.${RESET}"
+    fi
+
+    echo
+    echo -e "${CYAN}Environment check finished.${RESET}"
+    pause
+}
+
+show_help() {
+    header
+    echo -e "${BOLD}Reverse Manager 3.3 - Help & documentation${RESET}"
+    echo
+    echo -e "${CYAN}Concepts:${RESET}"
+    echo
+    echo "  • This server is a reverse proxy in front of multiple backends."
+    echo "  • DB line format:"
+    echo "        domain;backend_url;wildcard=yes|no;ssl=yes|no"
+    echo
+    echo "  • SSL 'yes' means port 80 redirects to 443 and TLS terminates here"
+    echo "    using certificates under: ${CERT_DIR}/<domain>.pem/.key"
+    echo
+    echo "  • When enabling SSL the script:"
+    echo "      - Checks if cert+key already exist for that domain."
+    echo "      - If they exist, you can reuse them or generate new ones."
+    echo "      - If they do not exist, it auto-generates a self-signed cert."
+    echo
+    echo "  • Typical flow:"
+    echo "      1. Test backend with curl (http://IP:PORT + Host header)."
+    echo "      2. Create domain (option 1)."
+    echo "      3. Test Nginx (option 6)."
+    echo "      4. Reload Nginx (option 7)."
+    echo
+    pause
+}
+
+main_menu() {
+    while true; do
+        header
+        echo -e "${BOLD}Main menu:${RESET}"
+        echo
+        echo -e "  ${GREEN}1${RESET}) Create domain"
+        echo -e "  ${GREEN}2${RESET}) List domains"
+        echo -e "  ${GREEN}3${RESET}) View domain Nginx config"
+        echo -e "  ${GREEN}4${RESET}) Edit domain"
+        echo -e "  ${GREEN}5${RESET}) Delete domain"
+        echo -e "  ${GREEN}6${RESET}) Test Nginx configuration"
+        echo -e "  ${GREEN}7${RESET}) Reload Nginx"
+        echo -e "  ${GREEN}8${RESET}) Environment check and basic setup"
+        echo -e "  ${GREEN}9${RESET}) Help and documentation"
+        echo -e "  ${GREEN}0${RESET}) Exit"
+        echo
+        read -rp "Choose an option: " c
+
+        case "$c" in
+            1) create_domain ;;
+            2) list_domains ;;
+            3) view_domain_conf ;;
+            4) edit_domain ;;
+            5) delete_domain ;;
+            6) test_nginx ;;
+            7) reload_nginx ;;
+            8) env_check_and_setup ;;
+            9) show_help ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}Invalid option, please try again.${RESET}"; smooth ;;
+        esac
+    done
+}
+
+require_root
+ensure_paths
+main_menu
