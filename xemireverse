@@ -765,27 +765,198 @@ env_check_and_setup() {
 
 show_help() {
     header
-    echo -e "${BOLD}Reverse Manager 3.3 - Help & documentation${RESET}"
+    echo -e "${BOLD}Reverse Manager 3.3 - Internal Documentation & Usage Guide${RESET}"
     echo
-    echo -e "${CYAN}Concepts:${RESET}"
+    echo -e "${CYAN}Purpose:${RESET}"
     echo
-    echo "  • This server is a reverse proxy in front of multiple backends."
-    echo "  • DB line format:"
-    echo "        domain;backend_url;wildcard=yes|no;ssl=yes|no"
+    echo "  This tool manages reverse proxy entries for multiple applications"
+    echo "  running behind a single Nginx reverse layer."
     echo
-    echo "  • SSL 'yes' means port 80 redirects to 443 and TLS terminates here"
-    echo "    using certificates under: ${CERT_DIR}/<domain>.pem/.key"
+    echo "  Topology typically looks like:"
     echo
-    echo "  • When enabling SSL the script:"
-    echo "      - Checks if cert+key already exist for that domain."
-    echo "      - If they exist, you can reuse them or generate new ones."
-    echo "      - If they do not exist, it auto-generates a self-signed cert."
+    echo "      Internet → Cloudflare → Reverse (Nginx) → Backend"
     echo
-    echo "  • Typical flow:"
-    echo "      1. Test backend with curl (http://IP:PORT + Host header)."
-    echo "      2. Create domain (option 1)."
-    echo "      3. Test Nginx (option 6)."
-    echo "      4. Reload Nginx (option 7)."
+    echo -e "${CYAN}Supported Use-Cases:${RESET}"
+    echo
+    echo "  • Static websites (CWP, Apache, Nginx)"
+    echo "  • WordPress/PHP through CWP"
+    echo "  • Django/Gunicorn (ports 9001+)"
+    echo "  • Node/FastAPI/Flask"
+    echo "  • Panels / HTTPS backends (e.g., CWP panel https)"
+    echo "  • Private services not exposed publicly"
+    echo "  • Subdomains and wildcard multi-tenant apps"
+    echo
+    echo -e "${CYAN}Internal DB Format:${RESET}"
+    echo "      domain;backend_url;wildcard=yes|no;ssl=yes|no"
+    echo
+    echo "  Example:"
+    echo "      example.com;http://192.168.2.120:9001;wildcard=no;ssl=yes"
+    echo
+    echo -e "${CYAN}Backend URL Rules:${RESET}"
+    echo
+    echo "  If protocol omitted → defaults to:"
+    echo "      http://host:port"
+    echo
+    echo "  Examples:"
+    echo "      192.168.2.116:80        → http backend"
+    echo "      http://192.168.2.120:9001"
+    echo "      https://127.0.0.1:2083  → used for panels or HTTPS services"
+    echo
+    echo "  Note: HTTPS backends trigger proxy_ssl_server_name + verify off"
+    echo
+    echo -e "${CYAN}Wildcard Logic:${RESET}"
+    echo
+    echo "  wildcard=yes means:"
+    echo "      *.domain.com → same backend"
+    echo
+    echo "  Overridable by explicit entries:"
+    echo "      api.domain.com can point somewhere else"
+    echo
+    echo -e "${CYAN}SSL Modes (Reverse Layer):${RESET}"
+    echo
+    echo "  ssl=no  → Reverse runs HTTP only"
+    echo "            Useful for internal/private services"
+    echo
+    echo "  ssl=yes → Reverse terminates TLS"
+    echo "            Port 80 → redirect → 443"
+    echo "            Certs under: ${CERT_DIR}/"
+    echo
+    echo "  SSL enable triggers:"
+    echo "    • certificate existence check"
+    echo "    • self-signed auto generation if missing"
+    echo "    • reuse or overwrite prompt if existing"
+    echo
+    echo -e "${CYAN}SSL Scenarios & Consequences:${RESET}"
+    echo
+    echo "  Scenario A) Cloudflare terminates SSL, Reverse in HTTP"
+    echo "     Cloudflare (HTTPS) → Reverse (HTTP) → Backend"
+    echo "     Pros:"
+    echo "       - simplest"
+    echo "       - no certs needed on reverse"
+    echo "     Cons:"
+    echo "       - LAN not encrypted"
+    echo
+    echo "  Scenario B) SSL on Reverse (common choice)"
+    echo "     Cloudflare (HTTPS) → Reverse (HTTPS) → Backend (HTTP)"
+    echo "     Pros:"
+    echo "       - secure edge"
+    echo "       - simple backend config"
+    echo "     Compatible with Cloudflare mode:"
+    echo "       - Full ✔"
+    echo "       - Full Strict (requires valid cert) ✔/✘"
+    echo
+    echo "  Scenario C) End-to-end SSL"
+    echo "     Cloudflare (HTTPS) → Reverse (HTTPS) → Backend (HTTPS)"
+    echo "     Used for panels or strict environments"
+    echo
+    echo -e "${CYAN}Cloudflare Modes (Important):${RESET}"
+    echo
+    echo "  Flexible:    X Not recommended"
+    echo "               Breaks strict logic"
+    echo
+    echo "  Full:        ✔ Works with self-signed cert on reverse"
+    echo
+    echo "  Full Strict: ✔ Requires valid cert on reverse"
+    echo "               For now you must manually install:"
+    echo "               • Cloudflare Origin CA   OR"
+    echo "               • Public CA cert         OR"
+    echo "               • Valid wildcard cert"
+    echo
+    echo -e "${CYAN}Backend Port Strategy:${RESET}"
+    echo "  • CWP Static/PHP         → :80"
+    echo "  • Wordpress/PHP FPM      → :80"
+    echo "  • Django/Gunicorn        → :9001+"
+    echo "  • Node/FastAPI           → custom"
+    echo "  • Panel (CWP, Webmail)   → https://127.0.0.1:2083"
+    echo
+    echo -e "${CYAN}Testing a Backend Before Adding:${RESET}"
+    echo
+    echo "  Example:"
+    echo "      curl -I -H \"Host: domain.com\" http://192.168.2.116:9001"
+    echo
+    echo "  If backend supports HTTPS:"
+    echo "      curl -Ik https://127.0.0.1:2083"
+    echo
+    echo -e "${CYAN}Backend Debugging Symptoms:${RESET}"
+    echo
+    echo "  • Cloudflare 521 → backend unreachable"
+    echo "  • Cloudflare 525 → SSL handshake fail (Strict mode)"
+    echo "  • 502 Bad Gateway → backend timeout or wrong port"
+    echo
+    echo -e "${CYAN}CWP Integration Notes:${RESET}"
+    echo
+    echo "  If using CWP as backend:"
+    echo "     Reverse should typically use → :80"
+    echo "     CWP panel itself uses HTTPS internally"
+    echo
+    echo "  Workflow when using AutoSSL from CWP:"
+    echo "     1. Create subdomain in CWP"
+    echo "     2. AutoSSL generates cert"
+    echo "     3. Reverse backend remains :80"
+    echo
+    echo -e "${CYAN}Certificate Strategy Choices:${RESET}"
+    echo
+    echo "  Option 1) Reverse self-signed + Cloudflare Full"
+    echo "     recommended for private stacks"
+    echo
+    echo "  Option 2) Reverse Origin CA + Cloudflare Strict"
+    echo "     recommended for public strict security"
+    echo
+    echo "  Option 3) CWP AutoSSL + Reverse HTTPS backend"
+    echo "     recommended when backend must be encrypted"
+    echo
+    echo -e "${CYAN}Delete / Edit Operations:${RESET}"
+    echo
+    echo "  Edit allows toggling:"
+    echo "     • backend url"
+    echo "     • backend port"
+    echo "     • wildcard"
+    echo "     • SSL + certificates"
+    echo
+    echo "  Changes auto-rewrite Nginx config each time."
+    echo
+    echo -e "${CYAN}Generated Files & Persistence:${RESET}"
+    echo
+    echo "  Nginx config:    ${NGINX_CONF_DIR}/<domain>.conf"
+    echo "  Registry DB:      ${DB_FILE}"
+    echo "  Certificates:     ${CERT_DIR}/<domain>.pem/.key"
+    echo
+    echo -e "${CYAN}Mini Architecture Diagram:${RESET}"
+    echo
+    echo "        +-------------------+"
+    echo "        |   Cloudflare Edge |"
+    echo "        +---------+---------+"
+    echo "                  | TLS"
+    echo "                  v"
+    echo "        +-------------------+"
+    echo "        |  Nginx Reverse    |"
+    echo "        +---------+---------+"
+    echo "                  | HTTP/HTTPS"
+    echo "                  v"
+    echo "        +-------------------+"
+    echo "        |    Backends       |"
+    echo "        +-------------------+"
+    echo
+    echo -e "${CYAN}Typical Workflow (Step-by-step):${RESET}"
+    echo
+    echo "  1. Test backend with curl"
+    echo "  2. Add domain via option 1"
+    echo "  3. Enable wildcard if needed"
+    echo "  4. Choose SSL mode"
+    echo "  5. nginx -t (option 6)"
+    echo "  6. Reload (option 7)"
+    echo "  7. Test via browser or curl"
+    echo
+    echo -e "${CYAN}Troubleshooting Checklist:${RESET}"
+    echo
+    echo "  • Is backend running?"
+    echo "  • Is backend port correct?"
+    echo "  • Is Cloudflare in Full/Strict?"
+    echo "  • Did you reload Nginx?"
+    echo "  • Do certs exist if Strict?"
+    echo
+    echo -e "${CYAN}Version:${RESET}"
+    echo "  Reverse Manager 3.3"
     echo
     pause
 }
