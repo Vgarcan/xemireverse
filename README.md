@@ -1,16 +1,3 @@
-Perfecto. Vamos a **actualizar tu documento** para que refleje la versión “pro” que ya tienes (la **3.6.0**, en inglés), con:
-
-* **Safe reload** con backup y rollback
-* **Audit y sanitize** de `conf.d`
-* Protección contra placeholders tipo `__PROXY_TIMEOUT__`
-* **Delete domain** que también borra **archivos asociados**, conf y certificados
-* Paths nuevos de backup y log
-* Ajustes de UI (badges, colores, TUI)
-
-Abajo te dejo el documento **ya actualizado** en Markdown, con **TOC clicable**.
-
----
-
 # `xemireverse` — Reverse Manager for Nginx
 
 Interactive CLI tool to manage Nginx reverse proxy vhosts for multiple backends (static sites, WordPress/PHP, Django, panels, etc.), with Cloudflare in front and optional SSL termination on the reverse.
@@ -566,8 +553,3 @@ Yes. It removes the vhost config and the `.pem` and `.key` files for that domain
 * Template types for WordPress, Django, static
 
 ---
-
-Si quieres, te lo dejo todavía más “manual de producto” añadiendo:
-
-* una sección de “Version history” (3.3, 3.5, 3.6)
-* y un “Quick start” de 10 líneas para cuando tengas prisa
