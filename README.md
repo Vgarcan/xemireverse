@@ -1,442 +1,232 @@
 # `xemireverse` — Reverse Manager for Nginx
 
-Interactive CLI tool to manage Nginx reverse proxy vhosts for multiple backends (static sites, WordPress/PHP, Django, panels, etc.), with Cloudflare in front and optional SSL termination on the reverse.
-
-Designed for setups like:
+Interactive CLI tool to safely manage Nginx reverse proxy virtual hosts for multiple backends, including WordPress, Django, Flask, FastAPI, static sites, control panels and internal services.
 
 ```text
-Internet → Cloudflare → Reverse Nginx (this script) → Backend (CWP / Django / etc.)
-```
-
----
+Internet → Cloudflare → Reverse Nginx (xemireverse) → Backend
+````
 
 ## Table of Contents
 
 * [Overview](#overview)
-* [What the script actually does](#what-the-script-actually-does)
-* [Architecture and Philosophy](#architecture-and-philosophy)
-* [System Requirements](#system-requirements)
+* [Features](#features)
+* [Architecture](#architecture)
+* [Requirements](#requirements)
 * [Installation](#installation)
-* [First Run: Environment Check](#first-run-environment-check)
-* [Core Concepts](#core-concepts)
-
-  * [Domain registry](#domain-registry)
-  * [Backend URL format](#backend-url-format)
-  * [Wildcard flag](#wildcard-flag)
-  * [SSL flag (reverse)](#ssl-flag-reverse)
-* [Security and Safety Features](#security-and-safety-features)
-
-  * [Atomic writes](#atomic-writes)
-  * [No placeholder tokens allowed](#no-placeholder-tokens-allowed)
-  * [Audit and sanitize conf.d](#audit-and-sanitize-confd)
-  * [Safe reload with backup and rollback](#safe-reload-with-backup-and-rollback)
-  * [Logging](#logging)
-* [Certificate Handling in Practice](#certificate-handling-in-practice)
-
-  * [Where certs live](#where-certs-live)
-  * [What happens when you enable SSL](#what-happens-when-you-enable-ssl)
-  * [Re-using vs regenerating certs](#re-using-vs-regenerating-certs)
-* [Cloudflare and SSL Modes](#cloudflare-and-ssl-modes)
-* [Backend Types and Port Examples](#backend-types-and-port-examples)
-* [Using the Menu](#using-the-menu)
-
-  * [Option 1: Create domain](#option-1-create-domain)
-  * [Option 2: List domains](#option-2-list-domains)
-  * [Option 3: View domain Nginx config](#option-3-view-domain-nginx-config)
-  * [Option 4: Edit domain](#option-4-edit-domain)
-  * [Option 5: Delete domain](#option-5-delete-domain)
-  * [Option 6: Test Nginx configuration](#option-6-test-nginx-configuration)
-  * [Option 7: Safe reload Nginx](#option-7-safe-reload-nginx)
-  * [Option 8: Audit conf.d](#option-8-audit-confd)
-  * [Option 9: Sanitize conf.d](#option-9-sanitize-confd)
-  * [Option 10: Environment check](#option-10-environment-check)
-* [Typical Workflows](#typical-workflows)
-
-  * [Workflow A: Simple HTTP backend (static or PHP)](#workflow-a-simple-http-backend-static-or-php)
-  * [Workflow B: Django backend on custom port](#workflow-b-django-backend-on-custom-port)
-  * [Workflow C: CWP AutoSSL plus Reverse SSL plus HTTPS backend](#workflow-c-cwp-autossl-plus-reverse-ssl-plus-https-backend)
+* [Usage](#usage)
+* [Database Format](#database-format)
 * [Files and Directories](#files-and-directories)
-* [Backup and Restore](#backup-and-restore)
+* [SSL Certificates](#ssl-certificates)
+* [Safety Features](#safety-features)
+* [Menu Options](#menu-options)
+* [Examples](#examples)
 * [Troubleshooting](#troubleshooting)
-* [FAQ](#faq)
-* [Future Ideas](#future-ideas)
-
----
 
 ## Overview
 
-`xemireverse` is a Bash-based interactive CLI that:
+`xemireverse` is a Bash-based terminal tool that manages Nginx reverse proxy configurations from an interactive menu.
 
-* keeps a **registry** of domains and their backends in a simple DB file
-* generates **Nginx vhost** configs under `/etc/nginx/conf.d`
-* optionally **terminates SSL** on the reverse with per-domain certificates
-* supports **safe apply**, meaning it validates Nginx before reload and can rollback
-* includes **audit and sanitize** tools to detect and fix broken config files
-* works well with **Cloudflare in front**
-* supports **LAN backends** (CWP, Django, internal apps)
+It creates and maintains domain mappings, generates Nginx vhost files, validates configuration before reload, creates backups, and rolls back automatically if something fails.
 
-Goal: you should **rarely** need to hand-edit vhost configs. The script keeps everything consistent, validated, and easy to recover.
+## Features
 
----
+* Create, edit, list, view and delete reverse proxy domains
+* Generate Nginx configs under `/etc/nginx/conf.d`
+* Support HTTP and HTTPS backends
+* Optional SSL termination on the reverse proxy
+* Wildcard domain support
+* Manual config edit mode
+* Safe Nginx reload with backup and rollback
+* Audit and sanitize existing `.conf` files
+* Remove CRLF and non printable characters
+* Block unresolved placeholder tokens
+* Delete associated certs when deleting a domain
+* Log operations to `/var/log/reverse-manager.log`
 
-## What the script actually does
-
-Key paths and files:
-
-* `NGINX_CONF_DIR="/etc/nginx/conf.d"`
-* `DB_FILE="/etc/nginx/reverse-manager.db"`
-* `CERT_DIR="/etc/ssl/cloudflare"`
-* `BACKUP_DIR="/var/backups/reverse-manager"`
-* `LOG_FILE="/var/log/reverse-manager.log"`
-
-DB format, one line per domain:
-
-```text
-domain;backend_url;wildcard=yes|no;ssl=yes|no
-```
-
-Actions provided:
-
-* Create, list, view, edit, delete domain mappings
-* Generate Nginx configs for:
-
-  * HTTP only
-  * HTTP redirect to HTTPS plus HTTPS vhost
-* Generate per-domain self-signed certs if needed
-* Audit and sanitize existing config files
-* Run Nginx validation tests
-* Reload Nginx using a safe workflow
-
----
-
-## Architecture and Philosophy
+## Architecture
 
 Recommended topology:
 
 ```text
-Client → Cloudflare → Reverse (this host) → Backend (CWP / Django / etc.)
+Client → Cloudflare → Reverse Nginx → Backend service
 ```
 
-Responsibilities:
+The reverse proxy is the public entry point. Backends can be local services, LAN services, CWP sites, Django apps, Flask apps, APIs, or admin panels.
 
-* Cloudflare:
+## Requirements
 
-  * public DNS
-  * edge TLS
-  * WAF and caching (optional)
-* Reverse:
+Required:
 
-  * routes traffic to backends
-  * optionally terminates TLS on 443
-  * is a single control point for all domains
-* Backend:
-
-  * serves the app
-  * typically on a private IP or LAN
-  * can be HTTP or HTTPS
-
----
-
-## System Requirements
-
-* Linux host with:
-
-  * `bash`
-  * `nginx`
-  * `openssl`
-  * `systemd` for `systemctl reload nginx`
-* Root privileges required
-* Nginx must include `/etc/nginx/conf.d/*.conf` (typical default)
+```bash
+bash
+nginx
+openssl
+root privileges
+```
 
 Optional:
 
-* SELinux tools, if you want to manage `httpd_can_network_connect`
-
----
+```bash
+systemctl
+service
+nano
+vi
+less
+```
 
 ## Installation
 
-1. Save as:
+Save the script as:
 
 ```bash
 /usr/local/bin/xemireverse
 ```
 
-2. Make executable:
+Make it executable:
 
 ```bash
 chmod +x /usr/local/bin/xemireverse
 ```
 
-3. Run as root:
+Run it:
 
 ```bash
 sudo xemireverse
 ```
 
----
+## Usage
 
-## First Run: Environment Check
+Start the tool:
 
-Menu option:
+```bash
+sudo xemireverse
+```
 
-> `10) Environment check`
-
-This shows:
-
-* nginx binary presence
-* nginx systemd unit presence
-* important paths used by the tool
-* a quick sanity check overview
-
----
-
-## Core Concepts
-
-### Domain registry
-
-Stored here:
+Main menu:
 
 ```text
+1  Create domain
+2  List domains
+3  View domain conf
+4  Edit domain
+5  Delete domain
+6  Test Nginx
+7  Safe reload Nginx
+8  Audit conf.d
+9  Sanitize conf.d
+10 Environment check
+0  Exit
+```
+
+## Database Format
+
+Registry file:
+
+```bash
 /etc/nginx/reverse-manager.db
 ```
 
-Line format:
+Format:
 
 ```text
-domain;backend_url;wildcard=yes|no;ssl=yes|no
+domain;backend_url;wildcard=yes|no;ssl=yes|no;mode=generated|manual
 ```
 
 Example:
 
 ```text
-site.example.com;http://192.168.2.116:9001;wildcard=no;ssl=yes
-api.example.com;https://192.168.2.50:8443;wildcard=no;ssl=yes
+example.com;http://127.0.0.1:8000;wildcard=no;ssl=yes;mode=generated
 ```
 
-### Backend URL format
+## Files and Directories
 
-You can enter with or without protocol. The tool normalizes.
+| Path                            | Purpose                 |
+| ------------------------------- | ----------------------- |
+| `/usr/local/bin/xemireverse`    | Main script             |
+| `/etc/nginx/conf.d`             | Nginx vhost configs     |
+| `/etc/nginx/reverse-manager.db` | Domain registry         |
+| `/etc/ssl/cloudflare`           | SSL certificate storage |
+| `/var/backups/reverse-manager`  | Automatic backups       |
+| `/var/log/reverse-manager.log`  | Operation logs          |
 
-Examples:
+## SSL Certificates
 
-| You type                     | Stored as                    |
-| ---------------------------- | ---------------------------- |
-| `192.168.2.116:80`           | `http://192.168.2.116:80`    |
-| `http://192.168.2.116:9001`  | `http://192.168.2.116:9001`  |
-| `https://192.168.2.120:8443` | `https://192.168.2.120:8443` |
-| `192.168.2.116`              | `http://192.168.2.116`       |
+Certificates are stored as:
 
-Backend HTTPS behavior:
-
-If backend is `https://...`, the generated vhost enables:
-
-```nginx
-proxy_ssl_server_name on;
-proxy_ssl_verify off;
+```bash
+/etc/ssl/cloudflare/example.com.pem
+/etc/ssl/cloudflare/example.com.key
 ```
 
-This avoids failures when the backend uses self-signed or mismatched certs.
+If SSL is enabled and no certificate exists, the tool can generate a self signed certificate automatically.
 
-### Wildcard flag
+For production, recommended certificates are:
 
-If `wildcard=yes`:
+* Cloudflare Origin CA
+* Let’s Encrypt
+* Commercial SSL certificate
 
-```nginx
-server_name domain.com *.domain.com;
-```
+## Safety Features
 
-If `wildcard=no`:
+Before applying changes, the tool:
 
-```nginx
-server_name domain.com www.domain.com;
-```
+1. Creates a backup
+2. Writes configs safely
+3. Sanitizes CRLF and non printable characters
+4. Blocks unresolved placeholder tokens
+5. Runs `nginx -t`
+6. Reloads Nginx only if validation passes
+7. Rolls back automatically if validation or reload fails
 
-### SSL flag (reverse)
-
-If `ssl=no`:
-
-* only HTTP vhost on port 80 is generated
-
-If `ssl=yes`:
-
-* port 80 vhost redirects to HTTPS
-* port 443 vhost terminates TLS using certs from `/etc/ssl/cloudflare`
-
----
-
-## Security and Safety Features
-
-### Atomic writes
-
-Configs are written to a temporary file and moved into place, preventing half-written configs that break Nginx.
-
-### No placeholder tokens allowed
-
-The tool blocks “unresolved placeholders” in configs such as:
+Forbidden placeholder example:
 
 ```text
 __PROXY_TIMEOUT__
 ```
 
-This directly prevents the classic error:
+## Menu Options
 
-```text
-proxy_read_timeout directive invalid value
-```
+### 1. Create domain
 
-### Audit and sanitize conf.d
+Creates a new registry entry and Nginx config.
 
-Audit detects:
+You will be asked for:
 
-* CRLF
-* non-printable characters
-* forbidden placeholder tokens
+* domain
+* deployment type
+* backend URL
+* wildcard yes/no
+* SSL yes/no
 
-Sanitize removes:
+### 2. List domains
 
-* CRLF
-* non-printable characters
+Displays all registered domains.
 
-This is useful if a file was edited from Windows or copied incorrectly.
+### 3. View domain conf
 
-### Safe reload with backup and rollback
+Shows the generated Nginx config for a selected domain.
 
-Before applying changes:
+### 4. Edit domain
 
-* creates a backup of `/etc/nginx/conf.d` under `/var/backups/reverse-manager`
+Allows you to:
 
-On apply:
+* change backend URL
+* toggle wildcard
+* toggle SSL
+* manually edit full config
+* save and apply safely
+* discard changes
 
-* runs `nginx -t`
-* reloads Nginx only if the test passes
-* if test or reload fails, it restores the backup and tries to recover
-
-### Logging
-
-All operations are logged to:
-
-```text
-/var/log/reverse-manager.log
-```
-
-Useful for debugging and auditing changes.
-
----
-
-## Certificate Handling in Practice
-
-### Where certs live
-
-Per-domain certs:
-
-```text
-/etc/ssl/cloudflare/<domain>.pem
-/etc/ssl/cloudflare/<domain>.key
-```
-
-### What happens when you enable SSL
-
-When SSL is enabled:
-
-* if cert and key exist, you can keep or regenerate
-* if missing, it generates a self-signed cert automatically
-
-### Re-using vs regenerating certs
-
-Re-use if you placed:
-
-* Cloudflare Origin CA
-* Let’s Encrypt
-* any valid cert
-
-Regenerate if you just need:
-
-* quick internal testing
-
----
-
-## Cloudflare and SSL Modes
-
-Typical recommendation:
-
-* Cloudflare SSL mode:
-
-  * Full or Full strict
-* Reverse:
-
-  * terminates TLS using local cert files
-* Backend:
-
-  * HTTP for LAN simplicity
-  * HTTPS if you want encryption reverse to backend
-
----
-
-## Backend Types and Port Examples
-
-| Type               | Example backend URL          |
-| ------------------ | ---------------------------- |
-| WordPress on CWP   | `192.168.2.116:80`           |
-| Django app         | `192.168.2.116:9001`         |
-| Another Django     | `192.168.2.116:9002`         |
-| CWP panel          | `https://192.168.2.116:2083` |
-| Internal API HTTPS | `https://192.168.2.200:8443` |
-
----
-
-## Using the Menu
-
-Run:
-
-```bash
-xemireverse
-```
-
-Menu options:
-
-* 1 Create domain
-* 2 List domains
-* 3 View domain conf
-* 4 Edit domain
-* 5 Delete domain
-* 6 Test Nginx
-* 7 Safe reload Nginx
-* 8 Audit conf.d
-* 9 Sanitize conf.d
-* 10 Environment check
-* 0 Exit
-
-### Option 1: Create domain
-
-Creates DB entry and config file, optionally certs, then applies safely.
-
-### Option 2: List domains
-
-Shows DB entries.
-
-### Option 3: View domain Nginx config
-
-Views the generated conf in `less`.
-
-### Option 4: Edit domain
-
-Allows changing backend, wildcard, SSL settings. Then regenerates and safely applies.
-
-### Option 5: Delete domain
+### 5. Delete domain
 
 Deletes:
 
-* DB entry
-* Nginx conf `/etc/nginx/conf.d/<domain>.conf`
-* associated cert files:
+* registry entry
+* Nginx config file
+* associated `.pem` certificate
+* associated `.key` file
 
-  * `/etc/ssl/cloudflare/<domain>.pem`
-  * `/etc/ssl/cloudflare/<domain>.key`
-
-This matches “delete all associated files” for the domain.
-
-### Option 6: Test Nginx configuration
+### 6. Test Nginx
 
 Runs:
 
@@ -444,112 +234,175 @@ Runs:
 nginx -t
 ```
 
-### Option 7: Safe reload Nginx
+### 7. Safe reload Nginx
 
-Creates a backup and attempts a safe apply with rollback if needed.
+Creates a backup, validates Nginx, reloads safely, and rolls back on failure.
 
-### Option 8: Audit conf.d
+### 8. Audit conf.d
 
-Reports problems in existing conf files.
+Checks `.conf` files for:
 
-### Option 9: Sanitize conf.d
+* CRLF characters
+* unresolved placeholders
+* non printable characters
 
-Cleans CRLF and non-printable characters and rolls back if Nginx validation fails.
+### 9. Sanitize conf.d
 
-### Option 10: Environment check
+Removes CRLF and non printable characters from `.conf` files.
 
-Shows OS, Nginx presence, and key directories.
+A backup is created before changes.
 
----
+### 10. Environment check
 
-## Typical Workflows
+Shows:
 
-### Workflow A: Simple HTTP backend (static or PHP)
+* nginx path
+* reload method
+* config path
+* database path
+* cert path
+* backup path
+* log path
 
-1. Create domain
-2. Backend `192.168.x.x:80`
-3. SSL yes for HTTPS on reverse
-4. Safe reload
+## Examples
 
-### Workflow B: Django backend on custom port
+### Django
 
-1. Backend `192.168.x.x:9001`
-2. SSL yes for HTTPS on reverse
-3. Use Host header checks if needed
-
-### Workflow C: CWP AutoSSL plus Reverse SSL plus HTTPS backend
-
-1. Start with backend pointing to CWP HTTP `:80`
-2. Let CWP generate AutoSSL
-3. Edit backend to `https://<ip>:443` if desired
-4. Safe reload
-
----
-
-## Files and Directories
-
-| Path                              | Purpose                 |
-| --------------------------------- | ----------------------- |
-| `/usr/local/bin/xemireverse`      | main CLI script         |
-| `/etc/nginx/conf.d/<domain>.conf` | generated vhost configs |
-| `/etc/nginx/reverse-manager.db`   | domain registry         |
-| `/etc/ssl/cloudflare/`            | reverse TLS certs       |
-| `/var/backups/reverse-manager/`   | automatic backups       |
-| `/var/log/reverse-manager.log`    | logs                    |
-
----
-
-## Backup and Restore
-
-Backups are created automatically before applying changes.
-
-Manual backup:
-
-```bash
-cp /etc/nginx/reverse-manager.db /root/reverse-manager.db.backup
-cp -r /etc/ssl/cloudflare /root/cloudflare-certs-backup
-cp -r /etc/nginx/conf.d /root/nginx-conf-backup
+```text
+Domain: app.example.com
+Backend: http://127.0.0.1:8000
+Wildcard: no
+SSL: yes
 ```
 
----
+### Flask or FastAPI
+
+```text
+Domain: api.example.com
+Backend: http://127.0.0.1:5000
+Wildcard: no
+SSL: yes
+```
+
+### WordPress or CWP
+
+```text
+Domain: example.com
+Backend: http://192.168.2.116:80
+Wildcard: no
+SSL: yes
+```
+
+### Internal HTTPS panel
+
+```text
+Domain: panel.example.com
+Backend: https://192.168.2.116:2083
+Wildcard: no
+SSL: yes
+```
+
+For HTTPS backends, the generated Nginx config enables:
+
+```nginx
+proxy_ssl_server_name on;
+proxy_ssl_verify off;
+```
 
 ## Troubleshooting
 
-Common commands:
+Test Nginx manually:
 
 ```bash
 nginx -t
-systemctl status nginx
-journalctl -xeu nginx.service
 ```
 
-Test backend directly:
+Check Nginx status:
 
 ```bash
-curl -I -H "Host: yourdomain.com" http://BACKEND_IP:PORT
+systemctl status nginx
 ```
 
----
+Check recent logs:
 
-## FAQ
+```bash
+tail -n 50 /var/log/reverse-manager.log
+```
 
-**Q: Do I need to type `http://` for backend URLs**
-No. The tool adds it automatically unless you explicitly use `https://`.
+Follow logs live:
 
-**Q: Does this encrypt reverse to backend traffic**
-Only if the backend URL starts with `https://`.
+```bash
+tail -f /var/log/reverse-manager.log
+```
 
-**Q: When I delete a domain, does it remove certs too**
-Yes. It removes the vhost config and the `.pem` and `.key` files for that domain.
+Test backend connectivity:
 
----
+```bash
+curl -I http://127.0.0.1:8000
+```
 
-## Future Ideas
+Or:
 
-* CLI non-interactive mode, apply from command line
-* File lock to prevent concurrent runs
-* Cloudflare real IP and trusted proxy config
-* Health checks to backends before applying
-* Template types for WordPress, Django, static
+```bash
+curl -I http://192.168.2.116:80
+```
 
----
+If the backend does not respond from the reverse proxy server, Nginx will not be able to proxy to it.
+
+## Cloudflare Recommended Mode
+
+Recommended Cloudflare SSL mode:
+
+```text
+Full
+```
+
+or:
+
+```text
+Full strict
+```
+
+Typical production flow:
+
+```text
+Browser HTTPS → Cloudflare HTTPS → Reverse Nginx HTTPS → Backend HTTP or HTTPS
+```
+
+## Backup and Rollback
+
+Backups are stored in:
+
+```bash
+/var/backups/reverse-manager
+```
+
+A backup is created before destructive or risky actions such as:
+
+* create
+* edit
+* delete
+* sanitize
+* reload
+
+If validation fails, the previous state is restored automatically.
+
+## Notes
+
+Run as root:
+
+```bash
+sudo xemireverse
+```
+
+Do not edit generated files manually unless needed.
+
+Use manual mode from the tool if you need custom Nginx directives.
+
+## Version
+
+```text
+Reverse Manager 3.6.0
+```
+
+```
