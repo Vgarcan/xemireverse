@@ -19,7 +19,7 @@ TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$TESTS_DIR")"
 
 SANDBOX="$(mktemp -d)"
-cleanup() { rm -rf "$SANDBOX"; }
+cleanup() { rm -rf "$SANDBOX" 2>/dev/null || true; }
 trap cleanup EXIT
 
 # shellcheck source=../xemireverse disable=SC1091
@@ -739,7 +739,20 @@ http {
 }
 NGXCONF
 
-  if nginx_out="$(nginx -t -c "$NGX_ROOT/nginx.conf" -p "$NGX_ROOT" -e "$NGX_ROOT/logs/error.log" 2>&1)"; then
+  # nginx -t does not stop at parsing, it runs the full init cycle and opens
+  # the listening sockets. The generated vhosts listen on 80 and 443, so the
+  # test needs the same privileges xemireverse itself requires in production.
+  nginx_cmd=(nginx)
+  nginx_privileged=1
+  if [[ "$(id -u)" -ne 0 ]]; then
+    if sudo -n true >/dev/null 2>&1; then
+      nginx_cmd=(sudo -n nginx)
+    else
+      nginx_privileged=0
+    fi
+  fi
+
+  if nginx_out="$("${nginx_cmd[@]}" -t -c "$NGX_ROOT/nginx.conf" -p "$NGX_ROOT" -e "$NGX_ROOT/logs/error.log" 2>&1)"; then
     ok "nginx -t accepts the generated configurations"
     printf '%s\n' "$nginx_out" | sed 's/^/         /'
     # nginx -t exits 0 on a deprecation warning, so warnings are surfaced
@@ -747,6 +760,11 @@ NGXCONF
     if printf '%s' "$nginx_out" | grep -qi 'warn'; then
       note "nginx reported warnings, see the lines above"
     fi
+  elif (( nginx_privileged == 0 )) && printf '%s' "$nginx_out" | grep -q 'Permission denied'; then
+    # Not a defect in the generated config, the parser already accepted it and
+    # only the privileged part of the cycle failed
+    printf '%s\n' "$nginx_out" | sed 's/^/         /'
+    skip "nginx -t needs root to open ports 80 and 443, run the suite as root or with sudo"
   else
     ko "nginx -t rejected the generated configurations: $nginx_out"
   fi
