@@ -374,9 +374,36 @@ websocket_path=/ws/
 ```
 
 A row that does not declare the capability is an HTTP only row, so upgrading
-`xemireverse` never changes the behaviour of an existing domain. A stored path
-is re-validated every time it is read, and an unusable value falls back to the
-default instead of reaching the config.
+`xemireverse` never changes the behaviour of an existing domain.
+
+### A missing field and a corrupted field are not the same thing
+
+The stored path is re-validated every time it is read, and the two failure
+modes are handled differently on purpose.
+
+**The key is absent.** That is a 3.5 or 3.6 row. It takes the defaults above,
+which is what keeps older registries working.
+
+**The key is present but the value does not validate.** That is corrupted
+data, and it is never repaired silently. Substituting `/ws/` there would
+publish a WebSocket endpoint on a path nobody configured, so instead the row is
+kept exactly as stored and marked invalid:
+
+```text
+example.com   ...   websocket=yes;websocket_path=oops
+```
+
+* the domain is listed with `INVALID PATH`
+* the edit screen shows the stored value and says what to do
+* a missing `.conf` is not regenerated from a substituted path
+* saving is refused, in generated and in manual mode
+* `db_save_entry` refuses to write an invalid path while the capability is on
+* reading the row never rewrites the registry
+
+The operator clears it by setting a valid path, edit option 5, or by disabling
+WebSocket support, edit option 4. With the capability disabled the field is
+inert and is normalized to the default on the next save, so a corrupted value
+never blocks an unrelated edit forever.
 
 ## Files and Directories
 
@@ -601,7 +628,16 @@ It covers:
 `shellcheck` and `nginx -t` run automatically when those binaries are present,
 and are reported as `SKIP` when they are not. The `nginx -t` case builds a
 throwaway `nginx.conf` around the generated vhosts, so it validates them
-without touching the real configuration.
+without touching the real configuration. Nginx warnings are reported as `NOTE`
+even when `nginx -t` exits successfully.
+
+### Continuous integration
+
+`.github/workflows/verify.yml` runs the same suite on an Ubuntu runner with
+`nginx` and `shellcheck` installed, for pushes to `main` and to the feature
+branch, and for pull requests targeting `main`. CI fails if any check reports
+`SKIP`, so `nginx -t` and `shellcheck` cannot silently go unexecuted there.
+It is verification only, with no deployment, no server access and no secrets.
 
 ## Troubleshooting
 

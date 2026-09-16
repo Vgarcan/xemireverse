@@ -1,0 +1,74 @@
+name: verify
+
+# Verification only. No deployment, no server access, no secrets.
+#
+# The development machine for this project is Windows, where nginx and
+# shellcheck are not available and the suite reports them as SKIP. This job
+# exists so both actually execute, on Linux, against the real Nginx binary.
+
+on:
+  push:
+    branches:
+      - main
+      - feat/websocket-capability
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Lint and verification suite
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install nginx and shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nginx shellcheck
+
+      - name: Report tool versions
+        run: |
+          bash --version | head -1
+          nginx -v
+          shellcheck --version | sed -n '2,4p'
+          openssl version
+
+      - name: Bash syntax check
+        run: bash -n xemireverse
+
+      - name: ShellCheck
+        run: |
+          shellcheck -S warning xemireverse
+          shellcheck -S warning tests/run_tests.sh
+
+      - name: Verification suite
+        run: |
+          set -o pipefail
+          bash tests/run_tests.sh | tee suite.log
+
+      - name: Require every check to have executed
+        run: |
+          # The suite degrades gracefully when a tool is missing. On Linux CI
+          # that degradation is a failure, nginx -t and shellcheck must run.
+          if grep -q '\[SKIP\]' suite.log; then
+            echo "CI must execute every check, but the suite skipped:"
+            grep '\[SKIP\]' suite.log
+            exit 1
+          fi
+
+          grep -q 'nginx -t accepts the generated configurations' suite.log \
+            || { echo "nginx -t did not report a result"; exit 1; }
+          grep -q 'shellcheck clean at warning level' suite.log \
+            || { echo "shellcheck did not report a result"; exit 1; }
+
+          echo "nginx -t and shellcheck both executed"
+
+          if grep -q '\[NOTE\] nginx reported warnings' suite.log; then
+            echo "Nginx accepted the configuration but emitted warnings, see the suite output"
+          fi
