@@ -722,7 +722,11 @@ if command -v nginx >/dev/null 2>&1; then
       -days 1 -subj "/CN=t2.example.com" >/dev/null 2>&1
   fi
 
+  # Every runtime path is redirected into the sandbox. Without an explicit pid
+  # the test inherits the packaged default, /run/nginx.pid, which nginx -t
+  # opens and which is not writable by an unprivileged user such as a CI runner.
   cat >"$NGX_ROOT/nginx.conf" <<NGXCONF
+pid $NGX_ROOT/nginx.pid;
 events { worker_connections 64; }
 http {
     access_log $NGX_ROOT/logs/access.log;
