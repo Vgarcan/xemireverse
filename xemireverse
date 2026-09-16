@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 ###############################################################################
-# Reverse Manager 3.6.0
+# Reverse Manager 3.7.0
 #
 # English version, professional TUI, safe-by-default Nginx reverse manager.
 #
@@ -11,9 +11,16 @@
 # 4) Automatic backup and rollback on failure
 # 5) Audit and sanitize existing conf.d files
 # 6) When deleting a domain, remove associated files (conf and certs)
+# 7) Proxy behaviour follows the capabilities an application declares,
+#    it is never inferred from backing services such as Redis
 #
-# DB format
-# domain;backend_url;wildcard=yes|no;ssl=yes|no
+# DB format, current
+# domain;backend_url;wildcard=yes|no;ssl=yes|no;mode=generated|manual;\
+#   profile=<slug>;websocket=yes|no;websocket_path=/ws/
+#
+# Every field after the backend URL is a key=value pair, so older rows written
+# by 3.5 and 3.6 stay valid. Missing keys fall back to safe defaults:
+#   mode=generated, profile=generic, websocket=no, websocket_path=/ws/
 ###############################################################################
 
 set -Eeuo pipefail
@@ -23,7 +30,7 @@ IFS=$'\n\t'
 # Configuration
 ###############################################################################
 APP_NAME="Reverse Manager"
-APP_VERSION="3.6.0"
+APP_VERSION="3.7.0"
 
 NGINX_CONF_DIR="/etc/nginx/conf.d"
 DB_FILE="/etc/nginx/reverse-manager.db"
@@ -42,6 +49,33 @@ DEFAULT_PROXY_SEND_TIMEOUT="600"
 DEFAULT_PROXY_READ_TIMEOUT="600"
 DEFAULT_CLIENT_BODY_TIMEOUT="300"
 DEFAULT_SEND_TIMEOUT="300"
+
+# Application capabilities
+# A capability describes proxy behaviour the application actually needs.
+# It is declared by the operator, never guessed from the stack behind the
+# backend. WebSocket is the first one.
+DEFAULT_PROFILE="generic"
+DEFAULT_WEBSOCKET="no"
+DEFAULT_WEBSOCKET_PATH="/ws/"
+
+# WebSocket connections idle between frames, so they get their own timeouts
+# instead of the shorter request oriented ones above.
+DEFAULT_WEBSOCKET_READ_TIMEOUT="600"
+DEFAULT_WEBSOCKET_SEND_TIMEOUT="600"
+
+# Parsed DB row, filled by parse_entry
+ENTRY_DOMAIN=""
+ENTRY_BACKEND_URL=""
+ENTRY_WILDCARD="no"
+ENTRY_SSL="no"
+ENTRY_MODE="generated"
+ENTRY_PROFILE="$DEFAULT_PROFILE"
+ENTRY_WEBSOCKET="$DEFAULT_WEBSOCKET"
+ENTRY_WEBSOCKET_PATH="$DEFAULT_WEBSOCKET_PATH"
+
+# Answers collected by the capability prompts
+ASK_WEBSOCKET="$DEFAULT_WEBSOCKET"
+ASK_WEBSOCKET_PATH="$DEFAULT_WEBSOCKET_PATH"
 
 # Forbidden tokens inside conf files
 FORBIDDEN_TOKENS_REGEX='__[^ _][^ ]*__'
@@ -269,11 +303,99 @@ restore_nginx_confs() {
   restore_reverse_state "$1"
 }
 
+build_proxy_headers_block() {
+  # Forwarding headers shared by every generated location.
+  cat <<'EOF'
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host  $host;
+EOF
+}
+
+build_location_http_block() {
+  # Plain HTTP reverse proxy location.
+  # Connection "" clears the inbound hop by hop header so keepalive to the
+  # backend works. It deliberately does not carry an Upgrade handshake.
+  local backend_url="$1"
+  local proxy_ssl_block="$2"
+
+  cat <<EOF
+    location / {
+        proxy_pass ${backend_url};
+${proxy_ssl_block}$(build_proxy_tuning_block)
+
+$(build_proxy_headers_block)
+
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+    }
+EOF
+}
+
+build_location_websocket_block() {
+  # WebSocket capable location.
+  # Upgrade and Connection are hop by hop headers, Nginx drops them unless they
+  # are forwarded explicitly, which is why a generic location delivers the
+  # handshake to the backend as an ordinary HTTP request.
+  #
+  # Connection is set to the literal "upgrade" instead of the usual
+  # map $http_upgrade $connection_upgrade pattern. The map exists so that one
+  # shared location can serve both upgrade and non upgrade traffic, and it only
+  # lives in the http context. Since this location is emitted per domain under
+  # conf.d, a map here would either be duplicated across domains, which Nginx
+  # rejects, or would have to live in a shared file that can collide with a
+  # connection_upgrade map already defined by the distribution or a panel.
+  # A dedicated WebSocket location does not need the conditional form.
+  local backend_url="$1"
+  local proxy_ssl_block="$2"
+  local websocket_path="$3"
+
+  cat <<EOF
+    location ${websocket_path} {
+        proxy_pass ${backend_url};
+${proxy_ssl_block}$(build_proxy_tuning_block "$DEFAULT_WEBSOCKET_READ_TIMEOUT" "$DEFAULT_WEBSOCKET_SEND_TIMEOUT")
+
+$(build_proxy_headers_block)
+
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade           \$http_upgrade;
+        proxy_set_header Connection        "upgrade";
+    }
+EOF
+}
+
+build_locations_block() {
+  # Assembles the location set required by the declared capabilities.
+  local backend_url="$1"
+  local proxy_ssl_block="$2"
+  local websocket="$3"
+  local websocket_path="$4"
+
+  local block
+  block="$(build_location_http_block "$backend_url" "$proxy_ssl_block")"
+
+  if [[ "$websocket" == "yes" ]]; then
+    block+=$'\n\n'
+    block+="$(build_location_websocket_block "$backend_url" "$proxy_ssl_block" "$websocket_path")"
+  fi
+
+  printf '%s\n' "$block"
+}
+
 render_nginx_conf() {
   local domain="$1"
   local backend_url="$2"
   local wildcard="$3"
   local ssl="$4"
+  # Capability and profile arguments are optional so any caller that still uses
+  # the 3.6 signature renders a plain HTTP vhost, exactly as before.
+  local websocket="${5:-$DEFAULT_WEBSOCKET}"
+  local websocket_path="${6:-$DEFAULT_WEBSOCKET_PATH}"
+  local profile="${7:-$DEFAULT_PROFILE}"
+
+  [[ "$websocket" == "yes" ]] || websocket="no"
 
   local server_name_line=""
   if [[ "$wildcard" == "yes" ]]; then
@@ -287,19 +409,28 @@ render_nginx_conf() {
 
   local proxy_ssl_block=""
   if [[ "$backend_url" == https://* ]]; then
+    # Applies to every location, so an https backend also covers wss traffic.
     proxy_ssl_block=$'        proxy_ssl_server_name on;\n        proxy_ssl_verify off;\n'
   fi
 
-  local tuning_block
-  tuning_block="$(build_proxy_tuning_block)"
+  local websocket_note="no"
+  if [[ "$websocket" == "yes" ]]; then
+    websocket_note="yes, path ${websocket_path}"
+  fi
+
+  local locations_block
+  locations_block="$(build_locations_block \
+    "$backend_url" "$proxy_ssl_block" "$websocket" "$websocket_path")"
 
   cat <<EOF
 ##
 ## Auto generated by ${APP_NAME} ${APP_VERSION}
 ## Domain, ${domain}
 ## Backend, ${backend_url}
+## Profile, ${profile}
 ## Wildcard, ${wildcard}
 ## SSL, ${ssl}
+## WebSocket, ${websocket_note}
 ##
 
 EOF
@@ -312,32 +443,6 @@ server {
     return 301 https://\$host\$request_uri;
 }
 
-EOF
-  else
-    cat <<EOF
-server {
-    listen 80;
-    ${server_name_line}
-
-    location / {
-        proxy_pass ${backend_url};
-${proxy_ssl_block}${tuning_block}
-        proxy_set_header Host              \$host;
-        proxy_set_header X-Real-IP         \$remote_addr;
-        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header X-Forwarded-Host  \$host;
-
-        proxy_http_version 1.1;
-        proxy_set_header Connection "";
-    }
-}
-
-EOF
-  fi
-
-  if [[ "$ssl" == "yes" ]]; then
-    cat <<EOF
 server {
     listen 443 ssl http2;
     ${server_name_line}
@@ -348,18 +453,17 @@ server {
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_prefer_server_ciphers on;
 
-    location / {
-        proxy_pass ${backend_url};
-${proxy_ssl_block}${tuning_block}
-        proxy_set_header Host              \$host;
-        proxy_set_header X-Real-IP         \$remote_addr;
-        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header X-Forwarded-Host  \$host;
+${locations_block}
+}
 
-        proxy_http_version 1.1;
-        proxy_set_header Connection "";
-    }
+EOF
+  else
+    cat <<EOF
+server {
+    listen 80;
+    ${server_name_line}
+
+${locations_block}
 }
 
 EOF
@@ -383,11 +487,15 @@ ensure_domain_conf_present() {
   local backend_url="$2"
   local wildcard="$3"
   local ssl="$4"
+  local websocket="${5:-$DEFAULT_WEBSOCKET}"
+  local websocket_path="${6:-$DEFAULT_WEBSOCKET_PATH}"
+  local profile="${7:-$DEFAULT_PROFILE}"
   local conf_path
   conf_path="$(domain_conf_path "$domain")"
 
   if [[ ! -f "$conf_path" ]]; then
-    generate_nginx_conf "$domain" "$backend_url" "$wildcard" "$ssl"
+    generate_nginx_conf "$domain" "$backend_url" "$wildcard" "$ssl" \
+      "$websocket" "$websocket_path" "$profile"
   fi
 }
 
@@ -435,6 +543,55 @@ normalize_backend_url() {
   return 0
 }
 
+normalize_websocket_path() {
+  # Structured input only, never raw Nginx syntax.
+  # Accepts /ws/, /socket/, /ws/chat/ and prints the normalized prefix path.
+  # Rejects anything that is not a plain absolute path, which keeps user input
+  # from reaching the config as a directive, a comment, or a new block.
+  local input="$1"
+
+  # Trim surrounding whitespace only, any whitespace left inside is a reject
+  input="${input#"${input%%[![:space:]]*}"}"
+  input="${input%"${input##*[![:space:]]}"}"
+
+  [[ -n "$input" ]] || return 1
+  (( ${#input} <= 128 )) || return 1
+  [[ "$input" == /* ]] || return 1
+  [[ "$input" =~ ^/[A-Za-z0-9._~/-]*$ ]] || return 1
+  [[ "$input" != *"//"* ]] || return 1
+  [[ "$input" != *".."* ]] || return 1
+  # A bare / would collide with the root location and break the vhost
+  [[ "$input" != "/" ]] || return 1
+
+  # Prefix locations behave predictably with a trailing slash, /ws would also
+  # match /wsadmin
+  [[ "$input" == */ ]] || input="${input}/"
+
+  printf '%s\n' "$input"
+  return 0
+}
+
+profile_slug_from_choice() {
+  # Maps the deployment type menu answer to the value persisted in the DB
+  case "$1" in
+    1) printf 'wordpress-php' ;;
+    2) printf 'django' ;;
+    3) printf 'flask-fastapi' ;;
+    4) printf 'static' ;;
+    *) printf 'generic' ;;
+  esac
+}
+
+profile_label() {
+  case "$1" in
+    wordpress-php) printf 'WordPress / PHP' ;;
+    django) printf 'Django' ;;
+    flask-fastapi) printf 'Flask / FastAPI' ;;
+    static) printf 'Static site' ;;
+    *) printf 'Generic service' ;;
+  esac
+}
+
 show_create_domain_guide() {
   local profile="$1"
 
@@ -453,7 +610,7 @@ show_create_domain_guide() {
   echo
 
   case "$profile" in
-    1)
+    wordpress-php)
       badge_info "WordPress / PHP"
       echo "  Use the web origin that actually serves the site, often Apache,"
       echo "  LiteSpeed, or a CWP vhost on another port or private IP."
@@ -464,7 +621,7 @@ show_create_domain_guide() {
       echo "  SSL on reverse: usually yes for the public domain."
       echo "  Wildcard: only if you also plan subdomains like blog.domain.com."
       ;;
-    2)
+    django)
       badge_info "Django"
       echo "  Point the backend to Gunicorn, uWSGI, or Daphne/ASGI on a reachable"
       echo "  address. That may be localhost, another container, or another server"
@@ -476,7 +633,7 @@ show_create_domain_guide() {
       echo "  SSL on reverse: yes for public access."
       echo "  Wildcard: yes only if you expect multiple subdomains."
       ;;
-    3)
+    flask-fastapi)
       badge_info "Flask / FastAPI"
       echo "  Use the app server address directly, usually Gunicorn or Uvicorn."
       echo "  The backend can listen on this server or a different machine in the"
@@ -486,7 +643,7 @@ show_create_domain_guide() {
       echo "  This script is the front door, so SSL on reverse is usually yes."
       echo "  Wildcard: only if the app is meant to answer on subdomains too."
       ;;
-    4)
+    static)
       badge_info "Static site"
       echo "  Use the port where the static server or panel serves files."
       echo "  That may be a local service, a separate host on the LAN, or a panel"
@@ -507,6 +664,75 @@ show_create_domain_guide() {
       ;;
   esac
   echo
+}
+
+ask_websocket_path() {
+  # Prompts until the answer is a safe prefix path. Sets ASK_WEBSOCKET_PATH.
+  local current="$1"
+  local raw=""
+  local normalized=""
+
+  while true; do
+    read -r -p "WebSocket path [${current}]: " raw
+    [[ -n "$raw" ]] || raw="$current"
+
+    if normalized="$(normalize_websocket_path "$raw")"; then
+      ASK_WEBSOCKET_PATH="$normalized"
+      if [[ "$normalized" != "$raw" ]]; then
+        badge_info "path normalized to ${normalized}"
+      fi
+      return 0
+    fi
+
+    badge_warn "invalid path, use an absolute prefix such as /ws/ or /ws/chat/"
+  done
+}
+
+ask_websocket_capability() {
+  # Capability question for create. Sets ASK_WEBSOCKET and ASK_WEBSOCKET_PATH.
+  # The profile only tunes the hint shown, it never decides the answer.
+  local profile="$1"
+  local current_path="$2"
+
+  ASK_WEBSOCKET="no"
+  ASK_WEBSOCKET_PATH="$current_path"
+
+  echo
+  echo -e "${FG_CYAN}${BOLD}Application capabilities${RESET}"
+  echo
+
+  case "$profile" in
+    django)
+      echo "  Django served through ASGI, Daphne or Uvicorn, with Channels"
+      echo "  realtime endpoints usually needs this."
+      ;;
+    flask-fastapi)
+      echo "  FastAPI or Starlette WebSocket endpoints need this."
+      ;;
+    wordpress-php)
+      echo "  Classic PHP sites normally do not need this."
+      ;;
+    static)
+      echo "  Static sites normally do not need this."
+      ;;
+    *)
+      echo "  Enable this only if the application serves WebSocket traffic."
+      ;;
+  esac
+
+  echo "  The proxy only needs to know whether a path carries WebSocket"
+  echo "  traffic. Backing services such as Redis are not a proxy concern."
+  echo
+
+  if ask_yes_no "does this application use WebSockets"; then
+    ASK_WEBSOCKET="yes"
+    ask_websocket_path "$current_path"
+  else
+    # Keep the stored path so re-enabling later offers the previous value
+    ASK_WEBSOCKET_PATH="$current_path"
+  fi
+
+  return 0
 }
 
 conf_must_not_contain_forbidden_tokens() {
@@ -591,14 +817,27 @@ db_save_entry() {
   local wildcard="$3"
   local ssl="$4"
   local mode="${5:-generated}"
+  local profile="${6:-$DEFAULT_PROFILE}"
+  local websocket="${7:-$DEFAULT_WEBSOCKET}"
+  local websocket_path="${8:-$DEFAULT_WEBSOCKET_PATH}"
+
+  # Capability values are normalized here so a malformed caller can never write
+  # something the renderer would have to interpret
+  [[ "$websocket" == "yes" ]] || websocket="no"
+  websocket_path="$(normalize_websocket_path "$websocket_path")" \
+    || websocket_path="$DEFAULT_WEBSOCKET_PATH"
+  [[ -n "$profile" ]] || profile="$DEFAULT_PROFILE"
 
   if db_entry_exists "$domain"; then
-    awk -F';' -v OFS=';' -v d="$domain" -v b="$backend_url" -v w="$wildcard" -v s="$ssl" -v m="$mode" '
-      $1==d {print d,b,"wildcard="w,"ssl="s,"mode="m; next}
+    awk -F';' -v OFS=';' -v d="$domain" -v b="$backend_url" -v w="$wildcard" \
+      -v s="$ssl" -v m="$mode" -v p="$profile" -v ws="$websocket" -v wp="$websocket_path" '
+      $1==d {print d,b,"wildcard="w,"ssl="s,"mode="m,"profile="p,"websocket="ws,"websocket_path="wp; next}
       {print}
     ' "$DB_FILE" > "${DB_FILE}.tmp" && mv -f "${DB_FILE}.tmp" "$DB_FILE"
   else
-    printf '%s;%s;wildcard=%s;ssl=%s;mode=%s\n' "$domain" "$backend_url" "$wildcard" "$ssl" "$mode" >> "$DB_FILE"
+    printf '%s;%s;wildcard=%s;ssl=%s;mode=%s;profile=%s;websocket=%s;websocket_path=%s\n' \
+      "$domain" "$backend_url" "$wildcard" "$ssl" "$mode" \
+      "$profile" "$websocket" "$websocket_path" >> "$DB_FILE"
   fi
 }
 
@@ -607,19 +846,47 @@ db_delete_entry() {
   awk -F';' -v d="$domain" '$1!=d {print}' "$DB_FILE" > "${DB_FILE}.tmp" && mv -f "${DB_FILE}.tmp" "$DB_FILE"
 }
 
+entry_field_value() {
+  # Reads a key=value field from a DB row, printing the default when the key is
+  # absent. This is what keeps rows written by older versions readable, they
+  # simply do not carry the newer keys.
+  local entry="$1"
+  local key="$2"
+  local default="${3:-}"
+
+  printf '%s' "$entry" | awk -F';' -v k="$key" -v d="$default" '{
+    # Fields 1 and 2 are the domain and the backend URL, keys start at 3
+    for (i = 3; i <= NF; i++) {
+      eq = index($i, "=")
+      if (eq > 0 && substr($i, 1, eq - 1) == k) {
+        print substr($i, eq + 1)
+        found = 1
+        exit
+      }
+    }
+  } END { if (!found) print d }'
+}
+
 parse_entry() {
   local entry="$1"
   ENTRY_DOMAIN="$(printf '%s' "$entry" | cut -d';' -f1)"
   ENTRY_BACKEND_URL="$(printf '%s' "$entry" | cut -d';' -f2)"
   ENTRY_WILDCARD="$(printf '%s' "$entry" | cut -d';' -f3 | cut -d'=' -f2)"
   ENTRY_SSL="$(printf '%s' "$entry" | cut -d';' -f4 | cut -d'=' -f2)"
-  ENTRY_MODE="$(printf '%s' "$entry" | awk -F';' '{
-    for (i=1; i<=NF; i++) {
-      split($i, kv, "=")
-      if (kv[1] == "mode") { print kv[2]; found=1; exit }
-    }
-  } END { if (!found) print "generated" }')"
+  ENTRY_MODE="$(entry_field_value "$entry" "mode" "generated")"
+  ENTRY_PROFILE="$(entry_field_value "$entry" "profile" "$DEFAULT_PROFILE")"
+  ENTRY_WEBSOCKET="$(entry_field_value "$entry" "websocket" "$DEFAULT_WEBSOCKET")"
+  ENTRY_WEBSOCKET_PATH="$(entry_field_value "$entry" "websocket_path" "$DEFAULT_WEBSOCKET_PATH")"
+
   [[ -n "$ENTRY_MODE" ]] || ENTRY_MODE="generated"
+  [[ -n "$ENTRY_PROFILE" ]] || ENTRY_PROFILE="$DEFAULT_PROFILE"
+
+  # A row that does not declare the capability is an HTTP only row
+  [[ "$ENTRY_WEBSOCKET" == "yes" ]] || ENTRY_WEBSOCKET="no"
+
+  # Never trust a stored path, it is re-validated before it reaches the config
+  ENTRY_WEBSOCKET_PATH="$(normalize_websocket_path "$ENTRY_WEBSOCKET_PATH")" \
+    || ENTRY_WEBSOCKET_PATH="$DEFAULT_WEBSOCKET_PATH"
 }
 
 select_domain_from_db() {
@@ -643,14 +910,18 @@ select_domain_from_db() {
   echo
 
   local idx=0
+  local ws_tag=""
   for line in "${lines[@]}"; do
     parse_entry "$line"
-    printf "  %2d) %-35s %s %s %s\n" \
+    ws_tag=""
+    [[ "$ENTRY_WEBSOCKET" == "yes" ]] && ws_tag="${FG_BLUE}[ws ${ENTRY_WEBSOCKET_PATH}]${RESET}"
+    printf "  %2d) %-35s %s %s %s %s\n" \
       "$((idx + 1))" \
       "${ENTRY_DOMAIN}" \
       "${FG_GRAY}${SYM_ARROW}${RESET}" \
       "${DIM}${ENTRY_BACKEND_URL}${RESET}" \
-      "${FG_MAGENTA}[${ENTRY_MODE}]${RESET}"
+      "${FG_MAGENTA}[${ENTRY_MODE}]${RESET}" \
+      "${ws_tag}"
     idx=$((idx + 1))
   done
 
@@ -714,6 +985,11 @@ setup_ssl_for_domain() {
 # Nginx config generation
 ###############################################################################
 build_proxy_tuning_block() {
+  # Timeouts are parameters so the WebSocket location can use longer values
+  # without emitting the same directive twice, which Nginx rejects as duplicate.
+  local read_timeout="${1:-$DEFAULT_PROXY_READ_TIMEOUT}"
+  local send_timeout="${2:-$DEFAULT_PROXY_SEND_TIMEOUT}"
+
   cat <<EOF
         client_max_body_size ${DEFAULT_CLIENT_MAX_BODY_SIZE};
         client_body_timeout ${DEFAULT_CLIENT_BODY_TIMEOUT};
@@ -722,8 +998,8 @@ build_proxy_tuning_block() {
         proxy_request_buffering off;
         proxy_buffering off;
         proxy_connect_timeout ${DEFAULT_PROXY_CONNECT_TIMEOUT};
-        proxy_send_timeout ${DEFAULT_PROXY_SEND_TIMEOUT};
-        proxy_read_timeout ${DEFAULT_PROXY_READ_TIMEOUT};
+        proxy_send_timeout ${send_timeout};
+        proxy_read_timeout ${read_timeout};
 EOF
 }
 
@@ -732,10 +1008,20 @@ generate_nginx_conf() {
   local backend_url="$2"
   local wildcard="$3"
   local ssl="$4"
+  local websocket="${5:-$DEFAULT_WEBSOCKET}"
+  local websocket_path="${6:-$DEFAULT_WEBSOCKET_PATH}"
+  local profile="${7:-$DEFAULT_PROFILE}"
+
+  # Last gate before the value becomes Nginx syntax
+  if [[ "$websocket" == "yes" ]]; then
+    websocket_path="$(normalize_websocket_path "$websocket_path")" \
+      || die "invalid websocket path for ${domain}"
+  fi
 
   local conf_file="${NGINX_CONF_DIR}/${domain}.conf"
   local tmp="${conf_file}.new.$$"
-  render_nginx_conf "$domain" "$backend_url" "$wildcard" "$ssl" >"$tmp"
+  render_nginx_conf "$domain" "$backend_url" "$wildcard" "$ssl" \
+    "$websocket" "$websocket_path" "$profile" >"$tmp"
 
   sanitize_text_file_inplace "$tmp"
 
@@ -865,12 +1151,17 @@ create_domain() {
   echo "  5 Generic service"
   echo
 
-  local profile="5"
-  profile="$(ask_choice "Profile" "1 2 3 4 5")"
+  local profile_choice="5"
+  profile_choice="$(ask_choice "Profile" "1 2 3 4 5")"
+
+  # The profile is persisted from here on, it drives UX and future defaults but
+  # never decides a capability on its own
+  local profile
+  profile="$(profile_slug_from_choice "$profile_choice")"
   show_create_domain_guide "$profile"
 
   badge_info "backend examples"
-  case "$profile" in
+  case "$profile_choice" in
     1)
       echo "  http://192.168.1.10:80"
       echo "  http://10.0.0.20:8080"
@@ -919,17 +1210,26 @@ create_domain() {
     setup_ssl_for_domain "$domain"
   fi
 
+  ask_websocket_capability "$profile" "$DEFAULT_WEBSOCKET_PATH"
+  local websocket="$ASK_WEBSOCKET"
+  local websocket_path="$ASK_WEBSOCKET_PATH"
+
   local backup_path
   backup_path="$(backup_nginx_confs)"
   badge_info "backup created, $backup_path"
   log_line "INFO" "Backup created at ${backup_path}"
 
-  db_save_entry "$domain" "$backend_url" "$wildcard" "$ssl" "generated"
-  generate_nginx_conf "$domain" "$backend_url" "$wildcard" "$ssl"
+  db_save_entry "$domain" "$backend_url" "$wildcard" "$ssl" "generated" \
+    "$profile" "$websocket" "$websocket_path"
+  generate_nginx_conf "$domain" "$backend_url" "$wildcard" "$ssl" \
+    "$websocket" "$websocket_path" "$profile"
 
   if safe_reload_nginx "$backup_path"; then
     badge_ok "domain created and applied safely"
     log_line "INFO" "Domain created and applied, ${domain}"
+    if [[ "$websocket" == "yes" ]]; then
+      log_line "INFO" "WebSocket capability enabled for ${domain} path=${websocket_path}"
+    fi
   else
     badge_fail "apply failed, rollback attempted"
     log_line "ERROR" "Create apply failed, ${domain}"
@@ -949,19 +1249,27 @@ list_domains() {
     return
   fi
 
-  printf "%-35s %-45s %-10s %-6s %-10s\n" "Domain" "Backend URL" "Wildcard" "SSL" "Mode"
-  printf "%-35s %-45s %-10s %-6s %-10s\n" "-----" "----------" "--------" "---" "----"
+  printf "%-35s %-45s %-10s %-6s %-10s %-20s\n" \
+    "Domain" "Backend URL" "Wildcard" "SSL" "Mode" "WebSocket"
+  printf "%-35s %-45s %-10s %-6s %-10s %-20s\n" \
+    "-----" "----------" "--------" "---" "----" "---------"
 
   local line
+  local ws_column
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     parse_entry "$line"
-    printf "%-35s %-45s %-10s %-6s %-10s\n" \
+
+    ws_column="no"
+    [[ "$ENTRY_WEBSOCKET" == "yes" ]] && ws_column="yes ${ENTRY_WEBSOCKET_PATH}"
+
+    printf "%-35s %-45s %-10s %-6s %-10s %-20s\n" \
       "$ENTRY_DOMAIN" \
       "$ENTRY_BACKEND_URL" \
       "$ENTRY_WILDCARD" \
       "$ENTRY_SSL" \
-      "$ENTRY_MODE"
+      "$ENTRY_MODE" \
+      "$ws_column"
   done < "$DB_FILE"
 
   pause
@@ -1057,16 +1365,23 @@ save_domain_edits() {
       [[ -n "$entry" ]] && parse_entry "$entry"
       return 1
     fi
-    db_save_entry "$ENTRY_DOMAIN" "$ENTRY_BACKEND_URL" "$ENTRY_WILDCARD" "$ENTRY_SSL" "manual"
+    # Manual mode keeps the operator's file, only the registry row is refreshed
+    db_save_entry "$ENTRY_DOMAIN" "$ENTRY_BACKEND_URL" "$ENTRY_WILDCARD" "$ENTRY_SSL" "manual" \
+      "$ENTRY_PROFILE" "$ENTRY_WEBSOCKET" "$ENTRY_WEBSOCKET_PATH"
   else
-    db_save_entry "$ENTRY_DOMAIN" "$ENTRY_BACKEND_URL" "$ENTRY_WILDCARD" "$ENTRY_SSL" "generated"
-    generate_nginx_conf "$ENTRY_DOMAIN" "$ENTRY_BACKEND_URL" "$ENTRY_WILDCARD" "$ENTRY_SSL"
+    db_save_entry "$ENTRY_DOMAIN" "$ENTRY_BACKEND_URL" "$ENTRY_WILDCARD" "$ENTRY_SSL" "generated" \
+      "$ENTRY_PROFILE" "$ENTRY_WEBSOCKET" "$ENTRY_WEBSOCKET_PATH"
+    generate_nginx_conf "$ENTRY_DOMAIN" "$ENTRY_BACKEND_URL" "$ENTRY_WILDCARD" "$ENTRY_SSL" \
+      "$ENTRY_WEBSOCKET" "$ENTRY_WEBSOCKET_PATH" "$ENTRY_PROFILE"
   fi
 
   if safe_reload_nginx "$backup_path"; then
     EDIT_DIRTY=0
     badge_ok "updated and applied safely"
     log_line "INFO" "Domain updated and applied, ${ENTRY_DOMAIN}"
+    # Records the capability state that is actually live, the toggle log above
+    # only records what the operator asked for
+    log_line "INFO" "Applied capabilities for ${ENTRY_DOMAIN}, websocket=${ENTRY_WEBSOCKET} path=${ENTRY_WEBSOCKET_PATH}"
     return 0
   fi
 
@@ -1122,7 +1437,8 @@ edit_domain() {
   if [[ ! -f "$conf_path" ]]; then
     conf_was_missing=1
   fi
-  ensure_domain_conf_present "$ENTRY_DOMAIN" "$ENTRY_BACKEND_URL" "$ENTRY_WILDCARD" "$ENTRY_SSL"
+  ensure_domain_conf_present "$ENTRY_DOMAIN" "$ENTRY_BACKEND_URL" "$ENTRY_WILDCARD" "$ENTRY_SSL" \
+    "$ENTRY_WEBSOCKET" "$ENTRY_WEBSOCKET_PATH" "$ENTRY_PROFILE"
   if (( conf_was_missing )); then
     EDIT_DIRTY=1
   fi
@@ -1132,9 +1448,15 @@ edit_domain() {
     echo -e "${BOLD}Editing${RESET}, ${FG_GREEN}${ENTRY_DOMAIN}${RESET}"
     echo
     badge_info "backend, ${ENTRY_BACKEND_URL}"
+    badge_info "profile, $(profile_label "$ENTRY_PROFILE")"
     badge_info "wildcard, ${ENTRY_WILDCARD}"
     badge_info "ssl, ${ENTRY_SSL}"
     badge_info "mode, ${ENTRY_MODE}"
+    if [[ "$ENTRY_WEBSOCKET" == "yes" ]]; then
+      badge_info "websocket, yes, path ${ENTRY_WEBSOCKET_PATH}"
+    else
+      badge_info "websocket, no"
+    fi
     if (( EDIT_DIRTY )); then
       badge_warn "pending changes"
     else
@@ -1145,9 +1467,11 @@ edit_domain() {
     echo "  1 Change backend URL"
     echo "  2 Toggle wildcard"
     echo "  3 Toggle SSL"
-    echo "  4 Edit full config manually"
-    echo "  5 Save and apply changes"
-    echo "  6 Discard changes"
+    echo "  4 Toggle WebSocket support"
+    echo "  5 Change WebSocket path"
+    echo "  6 Edit full config manually"
+    echo "  7 Save and apply changes"
+    echo "  8 Discard changes"
     echo "  0 Back"
     echo
 
@@ -1197,10 +1521,48 @@ edit_domain() {
         EDIT_DIRTY=1
         ;;
       4)
-        edit_domain_conf_manually "$conf_path"
+        if [[ "$ENTRY_MODE" == "manual" ]]; then
+          badge_warn "structured edits will replace the manual file on save"
+        fi
+        if [[ "$ENTRY_WEBSOCKET" == "yes" ]]; then
+          ENTRY_WEBSOCKET="no"
+          badge_ok "websocket disabled, the ${ENTRY_WEBSOCKET_PATH} location will be removed on save"
+          log_line "INFO" "WebSocket capability disabled for ${ENTRY_DOMAIN}"
+        else
+          ENTRY_WEBSOCKET="yes"
+          ask_websocket_path "$ENTRY_WEBSOCKET_PATH"
+          ENTRY_WEBSOCKET_PATH="$ASK_WEBSOCKET_PATH"
+          badge_ok "websocket enabled, path ${ENTRY_WEBSOCKET_PATH}"
+          log_line "INFO" "WebSocket capability enabled for ${ENTRY_DOMAIN} path=${ENTRY_WEBSOCKET_PATH}"
+        fi
+        ENTRY_MODE="generated"
+        EDIT_DIRTY=1
         sleep_soft
         ;;
       5)
+        if [[ "$ENTRY_WEBSOCKET" != "yes" ]]; then
+          badge_warn "websocket is disabled, enable it first with option 4"
+          sleep_soft
+          continue
+        fi
+        if [[ "$ENTRY_MODE" == "manual" ]]; then
+          badge_warn "structured edits will replace the manual file on save"
+        fi
+        local previous_path="$ENTRY_WEBSOCKET_PATH"
+        ask_websocket_path "$ENTRY_WEBSOCKET_PATH"
+        ENTRY_WEBSOCKET_PATH="$ASK_WEBSOCKET_PATH"
+        if [[ "$ENTRY_WEBSOCKET_PATH" != "$previous_path" ]]; then
+          log_line "INFO" "WebSocket path changed for ${ENTRY_DOMAIN}, ${previous_path} to ${ENTRY_WEBSOCKET_PATH}"
+          ENTRY_MODE="generated"
+          EDIT_DIRTY=1
+        fi
+        sleep_soft
+        ;;
+      6)
+        edit_domain_conf_manually "$conf_path"
+        sleep_soft
+        ;;
+      7)
         local backup_path
         backup_path="$SESSION_BACKUP_PATH"
         if [[ -z "$backup_path" ]]; then
@@ -1213,7 +1575,7 @@ edit_domain() {
         save_domain_edits "$backup_path" "$conf_path"
         pause
         ;;
-      6)
+      8)
         if ask_yes_no "discard all changes for ${ENTRY_DOMAIN}"; then
           restore_reverse_state "$SESSION_BACKUP_PATH" || true
           entry="$(db_get_entry_exact "$ENTRY_DOMAIN" 2>/dev/null || true)"
@@ -1354,7 +1716,11 @@ main_menu() {
 ###############################################################################
 # Boot
 ###############################################################################
-require_root
-ensure_paths
-log_line "INFO" "Started ${APP_NAME} ${APP_VERSION}"
-main_menu
+# The TUI only starts when the file is executed. Sourcing it exposes the
+# helpers to the test suite without touching the system or requiring root.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  require_root
+  ensure_paths
+  log_line "INFO" "Started ${APP_NAME} ${APP_VERSION}"
+  main_menu
+fi
