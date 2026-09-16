@@ -72,6 +72,8 @@ ENTRY_MODE="generated"
 ENTRY_PROFILE="$DEFAULT_PROFILE"
 ENTRY_WEBSOCKET="$DEFAULT_WEBSOCKET"
 ENTRY_WEBSOCKET_PATH="$DEFAULT_WEBSOCKET_PATH"
+# Set when the row stores a websocket_path that does not validate
+ENTRY_WEBSOCKET_INVALID=0
 
 # Answers collected by the capability prompts
 ASK_WEBSOCKET="$DEFAULT_WEBSOCKET"
@@ -494,6 +496,16 @@ ensure_domain_conf_present() {
   conf_path="$(domain_conf_path "$domain")"
 
   if [[ ! -f "$conf_path" ]]; then
+    # A stored capability that no longer validates is not rendered with a
+    # substituted path. The domain stays without a conf until the operator
+    # fixes or disables it from the edit menu.
+    if [[ "$websocket" == "yes" ]] \
+      && ! normalize_websocket_path "$websocket_path" >/dev/null 2>&1; then
+      badge_warn "config missing for ${domain}, not regenerated, stored websocket path is invalid"
+      log_line "WARN" "Skipped regeneration for ${domain}, invalid stored websocket path"
+      return 0
+    fi
+
     generate_nginx_conf "$domain" "$backend_url" "$wildcard" "$ssl" \
       "$websocket" "$websocket_path" "$profile"
   fi
@@ -821,12 +833,25 @@ db_save_entry() {
   local websocket="${7:-$DEFAULT_WEBSOCKET}"
   local websocket_path="${8:-$DEFAULT_WEBSOCKET_PATH}"
 
-  # Capability values are normalized here so a malformed caller can never write
-  # something the renderer would have to interpret
   [[ "$websocket" == "yes" ]] || websocket="no"
-  websocket_path="$(normalize_websocket_path "$websocket_path")" \
-    || websocket_path="$DEFAULT_WEBSOCKET_PATH"
   [[ -n "$profile" ]] || profile="$DEFAULT_PROFILE"
+
+  # Write boundary for the capability.
+  # With the capability enabled the path is load bearing, so an unusable value
+  # is refused rather than converted, otherwise the registry would end up
+  # declaring an endpoint the operator never asked for.
+  # With the capability disabled the field is inert, so it is normalized to the
+  # default instead of blocking an unrelated edit.
+  local normalized_path=""
+  if normalized_path="$(normalize_websocket_path "$websocket_path")"; then
+    websocket_path="$normalized_path"
+  elif [[ "$websocket" == "yes" ]]; then
+    badge_fail "refusing to store an invalid websocket path for ${domain}"
+    log_line "ERROR" "Registry write refused for ${domain}, invalid websocket path"
+    return 1
+  else
+    websocket_path="$DEFAULT_WEBSOCKET_PATH"
+  fi
 
   if db_entry_exists "$domain"; then
     awk -F';' -v OFS=';' -v d="$domain" -v b="$backend_url" -v w="$wildcard" \
@@ -844,6 +869,21 @@ db_save_entry() {
 db_delete_entry() {
   local domain="$1"
   awk -F';' -v d="$domain" '$1!=d {print}' "$DB_FILE" > "${DB_FILE}.tmp" && mv -f "${DB_FILE}.tmp" "$DB_FILE"
+}
+
+entry_has_field() {
+  # True when the row actually carries the key, whatever its value.
+  # The difference matters, a missing key is an older row that takes the
+  # default, a key that is present but unusable is corrupted data.
+  local entry="$1"
+  local key="$2"
+
+  printf '%s' "$entry" | awk -F';' -v k="$key" '{
+    for (i = 3; i <= NF; i++) {
+      eq = index($i, "=")
+      if (eq > 0 && substr($i, 1, eq - 1) == k) { found = 1; exit }
+    }
+  } END { exit found ? 0 : 1 }'
 }
 
 entry_field_value() {
@@ -876,7 +916,6 @@ parse_entry() {
   ENTRY_MODE="$(entry_field_value "$entry" "mode" "generated")"
   ENTRY_PROFILE="$(entry_field_value "$entry" "profile" "$DEFAULT_PROFILE")"
   ENTRY_WEBSOCKET="$(entry_field_value "$entry" "websocket" "$DEFAULT_WEBSOCKET")"
-  ENTRY_WEBSOCKET_PATH="$(entry_field_value "$entry" "websocket_path" "$DEFAULT_WEBSOCKET_PATH")"
 
   [[ -n "$ENTRY_MODE" ]] || ENTRY_MODE="generated"
   [[ -n "$ENTRY_PROFILE" ]] || ENTRY_PROFILE="$DEFAULT_PROFILE"
@@ -884,9 +923,38 @@ parse_entry() {
   # A row that does not declare the capability is an HTTP only row
   [[ "$ENTRY_WEBSOCKET" == "yes" ]] || ENTRY_WEBSOCKET="no"
 
-  # Never trust a stored path, it is re-validated before it reaches the config
-  ENTRY_WEBSOCKET_PATH="$(normalize_websocket_path "$ENTRY_WEBSOCKET_PATH")" \
-    || ENTRY_WEBSOCKET_PATH="$DEFAULT_WEBSOCKET_PATH"
+  # The stored path is never trusted, but the two failure modes are different.
+  # A missing key is a 3.5 or 3.6 row and takes the default. A key that is
+  # present and does not validate is corrupted data, and substituting the
+  # default there would silently publish a WebSocket endpoint on a path nobody
+  # configured. Such a row is kept exactly as stored and flagged instead, so the
+  # generated mode refuses to render it until the operator fixes it.
+  ENTRY_WEBSOCKET_INVALID=0
+  if entry_has_field "$entry" "websocket_path"; then
+    local stored_path
+    stored_path="$(entry_field_value "$entry" "websocket_path" "")"
+    if ! ENTRY_WEBSOCKET_PATH="$(normalize_websocket_path "$stored_path")"; then
+      ENTRY_WEBSOCKET_PATH="$stored_path"
+      ENTRY_WEBSOCKET_INVALID=1
+    fi
+  else
+    ENTRY_WEBSOCKET_PATH="$DEFAULT_WEBSOCKET_PATH"
+  fi
+}
+
+websocket_capability_is_broken() {
+  # True when the parsed row declares WebSockets on a path that cannot be
+  # rendered. Nothing is generated or written while this holds.
+  [[ "$ENTRY_WEBSOCKET" == "yes" ]] && (( ENTRY_WEBSOCKET_INVALID ))
+}
+
+websocket_path_suggestion() {
+  # Default offered by the prompt, never a value that failed validation
+  if (( ENTRY_WEBSOCKET_INVALID )) || [[ -z "$ENTRY_WEBSOCKET_PATH" ]]; then
+    printf '%s' "$DEFAULT_WEBSOCKET_PATH"
+    return 0
+  fi
+  printf '%s' "$ENTRY_WEBSOCKET_PATH"
 }
 
 select_domain_from_db() {
@@ -914,7 +982,11 @@ select_domain_from_db() {
   for line in "${lines[@]}"; do
     parse_entry "$line"
     ws_tag=""
-    [[ "$ENTRY_WEBSOCKET" == "yes" ]] && ws_tag="${FG_BLUE}[ws ${ENTRY_WEBSOCKET_PATH}]${RESET}"
+    if websocket_capability_is_broken; then
+      ws_tag="${FG_RED}[ws invalid path]${RESET}"
+    elif [[ "$ENTRY_WEBSOCKET" == "yes" ]]; then
+      ws_tag="${FG_BLUE}[ws ${ENTRY_WEBSOCKET_PATH}]${RESET}"
+    fi
     printf "  %2d) %-35s %s %s %s %s\n" \
       "$((idx + 1))" \
       "${ENTRY_DOMAIN}" \
@@ -1219,8 +1291,15 @@ create_domain() {
   badge_info "backup created, $backup_path"
   log_line "INFO" "Backup created at ${backup_path}"
 
-  db_save_entry "$domain" "$backend_url" "$wildcard" "$ssl" "generated" \
-    "$profile" "$websocket" "$websocket_path"
+  # The path comes from a prompt that only returns validated values, so this
+  # can only fail if the registry write itself was refused
+  if ! db_save_entry "$domain" "$backend_url" "$wildcard" "$ssl" "generated" \
+    "$profile" "$websocket" "$websocket_path"; then
+    badge_fail "domain not registered, nothing was applied"
+    pause
+    return
+  fi
+
   generate_nginx_conf "$domain" "$backend_url" "$wildcard" "$ssl" \
     "$websocket" "$websocket_path" "$profile"
 
@@ -1261,7 +1340,11 @@ list_domains() {
     parse_entry "$line"
 
     ws_column="no"
-    [[ "$ENTRY_WEBSOCKET" == "yes" ]] && ws_column="yes ${ENTRY_WEBSOCKET_PATH}"
+    if websocket_capability_is_broken; then
+      ws_column="INVALID PATH"
+    elif [[ "$ENTRY_WEBSOCKET" == "yes" ]]; then
+      ws_column="yes ${ENTRY_WEBSOCKET_PATH}"
+    fi
 
     printf "%-35s %-45s %-10s %-6s %-10s %-20s\n" \
       "$ENTRY_DOMAIN" \
@@ -1350,6 +1433,16 @@ save_domain_edits() {
   local backup_path="$1"
   local conf_path="$2"
 
+  # Nothing is applied while the declared capability cannot be rendered, in
+  # either mode. The registry keeps the value it already has, the operator
+  # decides whether to fix the path or turn the capability off.
+  if websocket_capability_is_broken; then
+    badge_fail "stored websocket path is invalid, ${ENTRY_WEBSOCKET_PATH}"
+    badge_info "fix it with option 5, or disable websocket support with option 4"
+    log_line "ERROR" "Refused to apply ${ENTRY_DOMAIN}, invalid stored websocket path"
+    return 1
+  fi
+
   if [[ "$ENTRY_MODE" == "manual" ]]; then
     if [[ ! -f "$conf_path" ]]; then
       badge_fail "manual conf file not found"
@@ -1366,11 +1459,17 @@ save_domain_edits() {
       return 1
     fi
     # Manual mode keeps the operator's file, only the registry row is refreshed
-    db_save_entry "$ENTRY_DOMAIN" "$ENTRY_BACKEND_URL" "$ENTRY_WILDCARD" "$ENTRY_SSL" "manual" \
-      "$ENTRY_PROFILE" "$ENTRY_WEBSOCKET" "$ENTRY_WEBSOCKET_PATH"
+    if ! db_save_entry "$ENTRY_DOMAIN" "$ENTRY_BACKEND_URL" "$ENTRY_WILDCARD" "$ENTRY_SSL" "manual" \
+      "$ENTRY_PROFILE" "$ENTRY_WEBSOCKET" "$ENTRY_WEBSOCKET_PATH"; then
+      badge_fail "registry not updated, nothing was applied"
+      return 1
+    fi
   else
-    db_save_entry "$ENTRY_DOMAIN" "$ENTRY_BACKEND_URL" "$ENTRY_WILDCARD" "$ENTRY_SSL" "generated" \
-      "$ENTRY_PROFILE" "$ENTRY_WEBSOCKET" "$ENTRY_WEBSOCKET_PATH"
+    if ! db_save_entry "$ENTRY_DOMAIN" "$ENTRY_BACKEND_URL" "$ENTRY_WILDCARD" "$ENTRY_SSL" "generated" \
+      "$ENTRY_PROFILE" "$ENTRY_WEBSOCKET" "$ENTRY_WEBSOCKET_PATH"; then
+      badge_fail "registry not updated, nothing was applied"
+      return 1
+    fi
     generate_nginx_conf "$ENTRY_DOMAIN" "$ENTRY_BACKEND_URL" "$ENTRY_WILDCARD" "$ENTRY_SSL" \
       "$ENTRY_WEBSOCKET" "$ENTRY_WEBSOCKET_PATH" "$ENTRY_PROFILE"
   fi
@@ -1452,7 +1551,10 @@ edit_domain() {
     badge_info "wildcard, ${ENTRY_WILDCARD}"
     badge_info "ssl, ${ENTRY_SSL}"
     badge_info "mode, ${ENTRY_MODE}"
-    if [[ "$ENTRY_WEBSOCKET" == "yes" ]]; then
+    if websocket_capability_is_broken; then
+      badge_fail "websocket, yes, stored path is invalid, ${ENTRY_WEBSOCKET_PATH}"
+      badge_warn "nothing can be applied until the path is fixed or websocket is disabled"
+    elif [[ "$ENTRY_WEBSOCKET" == "yes" ]]; then
       badge_info "websocket, yes, path ${ENTRY_WEBSOCKET_PATH}"
     else
       badge_info "websocket, no"
@@ -1528,10 +1630,18 @@ edit_domain() {
           ENTRY_WEBSOCKET="no"
           badge_ok "websocket disabled, the ${ENTRY_WEBSOCKET_PATH} location will be removed on save"
           log_line "INFO" "WebSocket capability disabled for ${ENTRY_DOMAIN}"
+          if (( ENTRY_WEBSOCKET_INVALID )); then
+            # The stored value was never a usable path, it is not carried
+            # forward for a later re-enable
+            ENTRY_WEBSOCKET_PATH="$DEFAULT_WEBSOCKET_PATH"
+            ENTRY_WEBSOCKET_INVALID=0
+            badge_info "the invalid stored path was dropped, default is ${ENTRY_WEBSOCKET_PATH}"
+          fi
         else
           ENTRY_WEBSOCKET="yes"
-          ask_websocket_path "$ENTRY_WEBSOCKET_PATH"
+          ask_websocket_path "$(websocket_path_suggestion)"
           ENTRY_WEBSOCKET_PATH="$ASK_WEBSOCKET_PATH"
+          ENTRY_WEBSOCKET_INVALID=0
           badge_ok "websocket enabled, path ${ENTRY_WEBSOCKET_PATH}"
           log_line "INFO" "WebSocket capability enabled for ${ENTRY_DOMAIN} path=${ENTRY_WEBSOCKET_PATH}"
         fi
@@ -1549,13 +1659,15 @@ edit_domain() {
           badge_warn "structured edits will replace the manual file on save"
         fi
         local previous_path="$ENTRY_WEBSOCKET_PATH"
-        ask_websocket_path "$ENTRY_WEBSOCKET_PATH"
+        ask_websocket_path "$(websocket_path_suggestion)"
         ENTRY_WEBSOCKET_PATH="$ASK_WEBSOCKET_PATH"
         if [[ "$ENTRY_WEBSOCKET_PATH" != "$previous_path" ]]; then
           log_line "INFO" "WebSocket path changed for ${ENTRY_DOMAIN}, ${previous_path} to ${ENTRY_WEBSOCKET_PATH}"
           ENTRY_MODE="generated"
           EDIT_DIRTY=1
         fi
+        # A path that came back from the prompt is valid by construction
+        ENTRY_WEBSOCKET_INVALID=0
         sleep_soft
         ;;
       6)

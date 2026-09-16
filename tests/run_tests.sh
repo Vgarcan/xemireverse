@@ -67,6 +67,11 @@ skip() {
   printf '  [SKIP] %s\n' "$1"
 }
 
+note() {
+  # Information the operator should see without it counting as a failure
+  printf '  [NOTE] %s\n' "$1"
+}
+
 assert_contains() {
   local haystack="$1" needle="$2" label="$3"
   if printf '%s' "$haystack" | grep -qF -- "$needle"; then
@@ -315,9 +320,90 @@ conf_legacy="$(render_nginx_conf "legacy35.example.com" "http://127.0.0.1:8080" 
 assert_not_contains "$conf_legacy" "Upgrade" "legacy row renders without Upgrade"
 assert_contains "$conf_legacy" 'proxy_set_header Connection "";' "legacy row keeps the plain HTTP behaviour"
 
-# A row carrying a corrupted path falls back instead of emitting it
+# A legacy row has no websocket_path key at all, so the default is safe
+parse_entry "legacy35.example.com;http://127.0.0.1:8080;wildcard=no;ssl=yes"
+assert_eq "$ENTRY_WEBSOCKET_INVALID" "0" "legacy row with the key absent is not flagged invalid"
+assert_eq "$ENTRY_WEBSOCKET_PATH" "/ws/" "legacy row with the key absent takes the default"
+
+# A modern row with a valid path is accepted as stored
+parse_entry "good.example.com;http://127.0.0.1:8000;wildcard=no;ssl=no;mode=generated;profile=django;websocket=yes;websocket_path=/socket/"
+assert_eq "$ENTRY_WEBSOCKET" "yes" "modern valid row keeps the capability"
+assert_eq "$ENTRY_WEBSOCKET_PATH" "/socket/" "modern valid row keeps the stored path"
+assert_eq "$ENTRY_WEBSOCKET_INVALID" "0" "modern valid row is not flagged invalid"
+
+# A modern row with an explicitly invalid path is flagged, never repaired
 parse_entry "broken.example.com;http://127.0.0.1:8000;wildcard=no;ssl=no;mode=generated;profile=django;websocket=yes;websocket_path=oops"
-assert_eq "$ENTRY_WEBSOCKET_PATH" "/ws/" "a corrupted stored path falls back to the default"
+assert_eq "$ENTRY_WEBSOCKET_INVALID" "1" "an explicitly invalid stored path is flagged"
+assert_eq "$ENTRY_WEBSOCKET_PATH" "oops" "the invalid value is kept as stored, not substituted"
+if websocket_capability_is_broken; then
+  ok "the capability reports itself as broken"
+else
+  ko "the capability reports itself as broken"
+fi
+assert_eq "$(websocket_path_suggestion)" "/ws/" "the prompt is offered a safe default, not the invalid value"
+
+# An explicitly empty value is an explicit value, so it is invalid too
+parse_entry "empty.example.com;http://127.0.0.1:8000;wildcard=no;ssl=no;mode=generated;profile=django;websocket=yes;websocket_path="
+assert_eq "$ENTRY_WEBSOCKET_INVALID" "1" "an explicitly empty path is flagged invalid"
+
+# Nothing is generated from a substituted default for a broken row
+parse_entry "broken.example.com;http://127.0.0.1:8000;wildcard=no;ssl=no;mode=generated;profile=django;websocket=yes;websocket_path=oops"
+rm -f "$NGINX_CONF_DIR/broken.example.com.conf"
+ensure_domain_conf_present "broken.example.com" "$ENTRY_BACKEND_URL" "$ENTRY_WILDCARD" "$ENTRY_SSL" \
+  "$ENTRY_WEBSOCKET" "$ENTRY_WEBSOCKET_PATH" "$ENTRY_PROFILE" >/dev/null 2>&1
+if [[ -f "$NGINX_CONF_DIR/broken.example.com.conf" ]]; then
+  ko "a broken row generates no config, a file was written"
+else
+  ok "a broken row generates no config"
+fi
+
+# The save path refuses the row in generated mode
+if save_domain_edits "$SANDBOX/backups" "$NGINX_CONF_DIR/broken.example.com.conf" >/dev/null 2>&1; then
+  ko "save_domain_edits refuses a broken row"
+else
+  ok "save_domain_edits refuses a broken row"
+fi
+
+# And in manual mode, so the corrupted value is never written back either
+ENTRY_MODE="manual"
+if save_domain_edits "$SANDBOX/backups" "$NGINX_CONF_DIR/broken.example.com.conf" >/dev/null 2>&1; then
+  ko "save_domain_edits refuses a broken row in manual mode"
+else
+  ok "save_domain_edits refuses a broken row in manual mode"
+fi
+
+# The write boundary refuses the same value
+if db_save_entry "reject.example.com" "http://127.0.0.1:8000" "no" "no" "generated" "django" "yes" "oops" >/dev/null 2>&1; then
+  ko "db_save_entry refuses an invalid path when the capability is on"
+else
+  ok "db_save_entry refuses an invalid path when the capability is on"
+fi
+if db_get_entry_exact "reject.example.com" >/dev/null 2>&1; then
+  ko "the refused row was not written"
+else
+  ok "the refused row was not written"
+fi
+
+# With the capability off the field is inert, so it is normalized rather than
+# blocking an unrelated edit
+if db_save_entry "inert.example.com" "http://127.0.0.1:8000" "no" "no" "generated" "django" "no" "oops" >/dev/null 2>&1; then
+  ok "db_save_entry accepts an unrelated edit when the capability is off"
+  assert_contains "$(db_get_entry_exact "inert.example.com")" "websocket_path=/ws/" "the inert field is normalized"
+else
+  ko "db_save_entry accepts an unrelated edit when the capability is off"
+fi
+
+# Reading a broken row must never rewrite it
+: >"$DB_FILE"
+broken_row="broken.example.com;http://127.0.0.1:8000;wildcard=no;ssl=no;mode=generated;profile=django;websocket=yes;websocket_path=oops"
+printf '%s\n' "$broken_row" >"$DB_FILE"
+db_before="$(cat "$DB_FILE")"
+parse_entry "$(db_get_entry_exact "broken.example.com")"
+ensure_domain_conf_present "broken.example.com" "$ENTRY_BACKEND_URL" "$ENTRY_WILDCARD" "$ENTRY_SSL" \
+  "$ENTRY_WEBSOCKET" "$ENTRY_WEBSOCKET_PATH" "$ENTRY_PROFILE" >/dev/null 2>&1
+save_domain_edits "$SANDBOX/backups" "$NGINX_CONF_DIR/broken.example.com.conf" >/dev/null 2>&1
+assert_eq "$(cat "$DB_FILE")" "$db_before" "reading and refusing a broken row leaves the registry byte identical"
+: >"$DB_FILE"
 
 # A legacy file has to survive a full read, write, read cycle untouched in shape
 : >"$DB_FILE"
@@ -387,7 +473,45 @@ assert_not_contains "$conf_after_disable" "Upgrade" "no Upgrade header left behi
 assert_contains "$conf_after_disable" "location / {" "root location intact"
 
 ###############################################################################
-# 8. Interactive create and edit flows
+# 8. ensure_domain_conf_present rebuilds a missing file with its capabilities
+#
+# Regression guard. The production path already passes the capability through,
+# this pins it so a future signature change cannot silently drop it.
+###############################################################################
+case_start "Rebuilding a missing config keeps the capability"
+
+: >"$DB_FILE"
+db_save_entry "missing.example.com" "http://127.0.0.1:8000" "no" "no" "generated" "django" "yes" "/ws/"
+parse_entry "$(db_get_entry_exact "missing.example.com")"
+
+missing_conf="$NGINX_CONF_DIR/missing.example.com.conf"
+rm -f "$missing_conf"
+if [[ -f "$missing_conf" ]]; then
+  ko "the config starts out missing"
+else
+  ok "the config starts out missing"
+fi
+
+ensure_domain_conf_present "missing.example.com" "$ENTRY_BACKEND_URL" "$ENTRY_WILDCARD" "$ENTRY_SSL" \
+  "$ENTRY_WEBSOCKET" "$ENTRY_WEBSOCKET_PATH" "$ENTRY_PROFILE" >/dev/null
+
+if [[ -f "$missing_conf" ]]; then
+  ok "the missing config was regenerated"
+  assert_contains "$(cat "$missing_conf")" "location /ws/ {" "the regenerated config carries the WebSocket location"
+  assert_contains "$(cat "$missing_conf")" 'proxy_set_header Upgrade           $http_upgrade;' "the regenerated config forwards Upgrade"
+  assert_contains "$(cat "$missing_conf")" "## Profile, django" "the regenerated config carries the profile"
+else
+  ko "the missing config was regenerated"
+fi
+
+# An existing file is left alone
+printf '%s\n' "# untouched marker" >"$missing_conf"
+ensure_domain_conf_present "missing.example.com" "$ENTRY_BACKEND_URL" "$ENTRY_WILDCARD" "$ENTRY_SSL" \
+  "$ENTRY_WEBSOCKET" "$ENTRY_WEBSOCKET_PATH" "$ENTRY_PROFILE" >/dev/null
+assert_contains "$(cat "$missing_conf")" "# untouched marker" "an existing config is not overwritten"
+
+###############################################################################
+# 9. Interactive create and edit flows
 #
 # Drives the real TUI functions with scripted answers. Screen clearing, pauses
 # and the Nginx calls are stubbed, everything else is the production path.
@@ -481,7 +605,7 @@ assert_contains "$(cat "$LOG_FILE")" "WebSocket capability disabled for flow.exa
 assert_contains "$(cat "$LOG_FILE")" "WebSocket path changed for flow.example.com" "edit logged the path change"
 
 ###############################################################################
-# 9. Existing safety guarantees still hold on generated files
+# 10. Existing safety guarantees still hold on generated files
 ###############################################################################
 case_start "Safety guarantees on the generated file"
 
@@ -549,7 +673,7 @@ assert_contains "$(db_get_entry_exact "manual.example.com")" "mode=manual" "manu
 assert_contains "$(db_get_entry_exact "manual.example.com")" "websocket=yes" "capability fields survive a manual mode save"
 
 ###############################################################################
-# 10. Backward compatible renderer signature
+# 11. Backward compatible renderer signature
 ###############################################################################
 case_start "3.6 renderer signature still works"
 conf_old_sig="$(render_nginx_conf "old.example.com" "http://127.0.0.1:8000" "no" "no")"
@@ -557,7 +681,7 @@ assert_contains "$conf_old_sig" "location / {" "renders with four arguments"
 assert_not_contains "$conf_old_sig" "location /ws/" "four argument call stays HTTP only"
 
 ###############################################################################
-# 11. Shell syntax and nginx validation
+# 12. Shell syntax and nginx validation
 ###############################################################################
 case_start "Shell and Nginx validation"
 
@@ -613,7 +737,12 @@ NGXCONF
 
   if nginx_out="$(nginx -t -c "$NGX_ROOT/nginx.conf" -p "$NGX_ROOT" -e "$NGX_ROOT/logs/error.log" 2>&1)"; then
     ok "nginx -t accepts the generated configurations"
-    printf '         %s\n' "$nginx_out"
+    printf '%s\n' "$nginx_out" | sed 's/^/         /'
+    # nginx -t exits 0 on a deprecation warning, so warnings are surfaced
+    # separately instead of disappearing into a green result
+    if printf '%s' "$nginx_out" | grep -qi 'warn'; then
+      note "nginx reported warnings, see the lines above"
+    fi
   else
     ko "nginx -t rejected the generated configurations: $nginx_out"
   fi
